@@ -49,7 +49,7 @@ def trim_for_model(text: str, max_chars: int = 20000) -> str:
 
 # ---------- App ----------
 def run():
-    st.title("🔗 Ameya's URL Summarizer (Lab 2)")
+    st.title("🔗 Ameya's URL Summarizer (HW 2)")
     st.write("Enter a URL below and choose how you want it summarized. You can also toggle between different models and output language.")
 
     # Load API key securely from Streamlit secrets
