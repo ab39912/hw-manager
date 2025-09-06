@@ -81,3 +81,6 @@ else:
 
             # Output the response to the app.
             st.write_stream(stream)
+
+# Optional alias for callers expecting lab1.main()
+main = run
