@@ -49,8 +49,8 @@ def trim_for_model(text: str, max_chars: int = 20000) -> str:
 
 # ---------- App ----------
 def run():
-    st.title("🔗 Ameya's URL Summarizer (HW 2)")
-    st.write("Enter a URL below and choose how you want it summarized. You can also toggle between different models.")
+    st.title("🔗 Ameya's URL Summarizer (Lab 2)")
+    st.write("Enter a URL below and choose how you want it summarized. You can also toggle between different models and output language.")
 
     # Load API key securely from Streamlit secrets
     openai_api_key = st.secrets["OPENAI_API_KEY"]
@@ -65,6 +65,14 @@ def run():
             "Summarize in 2 connecting paragraphs",
             "Summarize in 5 bullet points",
         ],
+        index=0,
+    )
+
+    # NEW: Sidebar: output language
+    st.sidebar.header("Output Language")
+    output_language = st.sidebar.selectbox(
+        "Select the language to output:",
+        ["English", "French", "Spanish", "German", "Hindi"],  # at least 3 options
         index=0,
     )
 
@@ -91,7 +99,7 @@ def run():
     summarize_clicked = st.button("Summarize")
 
     if (url and summarize_clicked) or (url and not summarize_clicked and st.session_state.get("auto_run_once") is None):
-        # Run once automatically on first valid URL entry (UX nicety)
+        # Run once automatically on first valid URL entry
         st.session_state["auto_run_once"] = True
 
         with st.spinner("Fetching and summarizing the page..."):
@@ -101,10 +109,27 @@ def run():
 
             content = trim_for_model(content)
 
-            instruction = pick_instruction(summary_option)
+            base_instruction = pick_instruction(summary_option)
+            # Ensure correct language in the prompt
+            instruction = (
+                f"{base_instruction} "
+                f"Write the entire output in {output_language}. "
+                f"Do not include any text in other languages. "
+                f"If translation is needed, translate as part of the summary."
+            )
+
             messages = [
-                {"role": "system", "content": "You are a helpful assistant that writes clear, faithful summaries."},
-                {"role": "user", "content": f"URL: {url}\n\nExtracted Text:\n{content}\n\nTask: {instruction}"},
+                {
+                    "role": "system",
+                    "content": (
+                        f"You are a helpful assistant that writes clear, faithful summaries. "
+                        f"Always respond in {output_language} only."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"URL: {url}\n\nExtracted Text:\n{content}\n\nTask: {instruction}",
+                },
             ]
 
             try:
@@ -113,7 +138,7 @@ def run():
                     messages=messages,
                     stream=True,
                 )
-                st.subheader(f"Summary (Model: {model})")
+                st.subheader(f"Summary (Model: {model}, Language: {output_language})")
                 st.write_stream(stream)
             except Exception as e:
                 st.error(f"Failed to generate summary: {e}")
