@@ -1,0 +1,9 @@
+# .streamlit/config.toml
+[server]
+headless = true
+port = 8501
+
+[theme]
+base="light"
+primaryColor="#4CAF50"
+font="sans serif"

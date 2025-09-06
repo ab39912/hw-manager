@@ -1,12 +1,12 @@
 import streamlit as st
-import hw1, hw2
+import lab1, lab2
 
-st.set_page_config(page_title="HW-Manager", layout="wide")
+st.set_page_config(page_title="Document QA", layout="wide")
 
 nav = st.navigation({
     "Labs": [
-        st.Page(hw1.run, title="HW 1", url_path="hw1"),
-        st.Page(hw2.run, title="HW 2 (Default)", url_path="hw2", default=True),
+        st.Page(lab1.run, title="Lab 1", url_path="lab-1"),
+        st.Page(lab2.run, title="Lab 2 (Default)", url_path="lab-2", default=True),
     ]
 })
 
