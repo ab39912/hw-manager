@@ -1,4 +1,8 @@
 streamlit
 openai
 pymupdf
+anthropic
+google-generativeai
+cohere
+requests
 bs4
