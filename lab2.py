@@ -271,10 +271,13 @@ def run():
             index=0,
         )
 
-    # OpenAI model selection (keeps the original Lab 2 behavior)
-    st.sidebar.header("Model Options (OpenAI)")
-    use_advanced = st.sidebar.checkbox("Use Advanced Model (GPT-4o)")
+    # -----------------------------
+    # OpenAI model options (shown ONLY when provider == OpenAI)
+    # -----------------------------
+    model = None
     if provider == "OpenAI":
+        st.sidebar.header("Model Options (OpenAI)")
+        use_advanced = st.sidebar.checkbox("Use Advanced Model (GPT-4o)")
         if use_advanced:
             model = "gpt-4o"
         else:
@@ -283,8 +286,6 @@ def run():
                 ["gpt-5-nano", "gpt-5-chat-latest"],
                 index=0,
             )
-    else:
-        model = None  # not used by non-OpenAI branches
 
     # Top-of-screen: URL input
     url = st.text_input(
