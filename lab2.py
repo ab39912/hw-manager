@@ -193,7 +193,7 @@ def summarize_with_cohere(api_key: str, url: str, content: str, base_instruction
 
 # ---------- App ----------
 def run():
-    st.title("🔗 Ameya's URL Summarizer (Lab 2)")
+    st.title("🔗 Ameya's URL Summarizer (HW 2)")
     st.write("Enter a URL below, pick your summary style, choose the **LLM provider** (and model, if OpenAI), and select the output language.")
 
     # Load all possible keys from secrets (some may be missing)
