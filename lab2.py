@@ -3,7 +3,7 @@ from openai import OpenAI
 import requests
 from bs4 import BeautifulSoup
 
-# Optional provider SDKs
+# Optional provider SDKs (gracefully handled if missing)
 try:
     import anthropic
 except Exception:
@@ -19,7 +19,21 @@ try:
 except Exception:
     cohere = None
 
-# ---------- Helpers ----------
+# ===========================
+# Anthropic model resolution
+# ===========================
+ANTHROPIC_MODEL_ALIASES = {
+    "sonnet": "claude-3-7-sonnet-20250219",
+    "haiku":  "claude-3-5-haiku-20241022",
+    "opus":   "claude-3-opus-20240229",
+}
+def resolve_anthropic_model(selected: str) -> str:
+    """Allow either a friendly alias (sonnet/haiku/opus) or a full Anthropic model ID."""
+    return ANTHROPIC_MODEL_ALIASES.get(selected, selected)
+
+# ===========================
+# Helpers
+# ===========================
 def read_url_content(url: str):
     """Fetch a URL and return visible text content."""
     try:
@@ -51,6 +65,7 @@ def pick_instruction(summary_option: str) -> str:
         return "Summarize the document in 5 clear bullet points."
 
 def trim_for_model(text: str, max_chars: int = 20000) -> str:
+    """Trim overly long content to keep prompt size reasonable."""
     if text and len(text) > max_chars:
         head = text[: max_chars // 2]
         tail = text[-max_chars // 2 :]
@@ -58,7 +73,7 @@ def trim_for_model(text: str, max_chars: int = 20000) -> str:
     return text
 
 def build_task_prompt(url: str, content: str, base_instruction: str, output_language: str) -> str:
-    """Unified task text for non-OpenAI providers (or those that don't use role messages)."""
+    """Unified task for providers that don't use role messages like OpenAI does."""
     return (
         f"Task: {base_instruction}\n"
         f"Write the entire output in {output_language}. Do not include any other language. "
@@ -66,12 +81,13 @@ def build_task_prompt(url: str, content: str, base_instruction: str, output_lang
         f"URL: {url}\n\nExtracted Text:\n{content}\n"
     )
 
-# ---------- Provider: OpenAI ----------
+# ===========================
+# Provider: OpenAI
+# ===========================
 def validate_openai_key(client: OpenAI) -> bool:
     try:
-        # Tiny probe to validate key (very low-cost)
         _ = client.chat.completions.create(
-            model="gpt-4o-mini",  # small/cheap probe; if unavailable it will still validate auth
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": "Reply with 'OK'."}],
             max_tokens=2,
         )
@@ -88,9 +104,11 @@ def summarize_with_openai(client: OpenAI, model: str, url: str, content: str, ba
         },
         {
             "role": "user",
-            "content": f"URL: {url}\n\nExtracted Text:\n{content}\n\nTask: {base_instruction} "
-                       f"Write the entire output in {output_language}. Do not include any other languages. "
-                       f"If translation is needed, translate as part of the summary."
+            "content": (
+                f"URL: {url}\n\nExtracted Text:\n{content}\n\n"
+                f"Task: {base_instruction} Write the entire output in {output_language}. "
+                f"Do not include any other languages. If translation is needed, translate as part of the summary."
+            ),
         },
     ]
     stream = client.chat.completions.create(
@@ -98,18 +116,21 @@ def summarize_with_openai(client: OpenAI, model: str, url: str, content: str, ba
         messages=messages,
         stream=True,
     )
-    st.subheader(f"Summary (Model: {model}, Language: {output_language})")
+    st.subheader(f"Summary (OpenAI: {model}, Language: {output_language})")
     st.write_stream(stream)
 
-# ---------- Provider: Anthropic (Claude) ----------
-def validate_anthropic_key(api_key: str) -> bool:
+# ===========================
+# Provider: Anthropic (Claude)
+# ===========================
+def validate_anthropic_key(api_key: str, selected_model: str) -> bool:
     if not anthropic:
         st.error("Anthropic SDK is not installed. Add `anthropic` to requirements.txt.")
         return False
     try:
-        client = anthropic.Client(api_key=api_key)
+        model_id = resolve_anthropic_model(selected_model)
+        client = anthropic.Anthropic(api_key=api_key)  # modern SDK
         _ = client.messages.create(
-            model="claude-3-5-sonnet-latest",
+            model=model_id,
             max_tokens=5,
             messages=[{"role": "user", "content": "Reply with OK"}],
         )
@@ -118,24 +139,33 @@ def validate_anthropic_key(api_key: str) -> bool:
         st.error(f"Anthropic key validation failed: {e}")
         return False
 
-def summarize_with_anthropic(api_key: str, url: str, content: str, base_instruction: str, output_language: str):
-    client = anthropic.Client(api_key=api_key)
+def summarize_with_anthropic(api_key: str, url: str, content: str, base_instruction: str, output_language: str, selected_model: str):
+    client = anthropic.Anthropic(api_key=api_key)
     prompt = build_task_prompt(url, content, base_instruction, output_language)
+    model_id = resolve_anthropic_model(selected_model)
     try:
         resp = client.messages.create(
-            model="claude-3-5-sonnet-latest",
+            model=model_id,
             max_tokens=1500,
             system=f"Always answer in {output_language}.",
             messages=[{"role": "user", "content": prompt}],
         )
-        # Anthropic SDK returns a list of content blocks; join the text parts
-        text = "".join(block.text for block in resp.content if hasattr(block, "text"))
-        st.subheader(f"Summary (Claude, Language: {output_language})")
+        # Robust extraction of text blocks
+        text_chunks = []
+        for part in getattr(resp, "content", []) or []:
+            t = getattr(part, "text", None)
+            if t:
+                text_chunks.append(t)
+        text = "".join(text_chunks).strip() or str(resp)
+
+        st.subheader(f"Summary (Claude: {model_id}, Language: {output_language})")
         st.write(text)
     except Exception as e:
         st.error(f"Claude summarization failed: {e}")
 
-# ---------- Provider: Google Gemini ----------
+# ===========================
+# Provider: Google Gemini
+# ===========================
 def validate_gemini_key(api_key: str) -> bool:
     if not genai:
         st.error("Google Generative AI SDK is not installed. Add `google-generativeai` to requirements.txt.")
@@ -162,7 +192,9 @@ def summarize_with_gemini(api_key: str, url: str, content: str, base_instruction
     except Exception as e:
         st.error(f"Gemini summarization failed: {e}")
 
-# ---------- Provider: Cohere ----------
+# ===========================
+# Provider: Cohere
+# ===========================
 def validate_cohere_key(api_key: str) -> bool:
     if not cohere:
         st.error("Cohere SDK is not installed. Add `cohere` to requirements.txt.")
@@ -180,10 +212,8 @@ def summarize_with_cohere(api_key: str, url: str, content: str, base_instruction
     prompt = build_task_prompt(url, content, base_instruction, output_language)
     try:
         resp = ch.chat(
-            model="command-r-plus",  # choose an appropriate Cohere chat model
-            message=(
-                f"System: Always respond in {output_language} only.\n\n{prompt}"
-            )
+            model="command-r-plus",
+            message=(f"System: Always respond in {output_language} only.\n\n{prompt}")
         )
         text = resp.text if hasattr(resp, "text") else (resp.output_text if hasattr(resp, "output_text") else str(resp))
         st.subheader(f"Summary (Cohere, Language: {output_language})")
@@ -191,10 +221,12 @@ def summarize_with_cohere(api_key: str, url: str, content: str, base_instruction
     except Exception as e:
         st.error(f"Cohere summarization failed: {e}")
 
-# ---------- App ----------
+# ===========================
+# App
+# ===========================
 def run():
     st.title("🔗 Ameya's URL Summarizer (HW 2)")
-    st.write("Enter a URL below, pick your summary style, choose the **LLM provider** (and model, if OpenAI), and select the output language.")
+    st.write("Enter a URL below, pick your summary style, choose the **LLM provider** (and model, if OpenAI/Anthropic), and select the output language.")
 
     # Load all possible keys from secrets (some may be missing)
     openai_api_key    = st.secrets.get("OPENAI_API_KEY", None)
@@ -222,7 +254,7 @@ def run():
         index=0,
     )
 
-    # Sidebar: LLM provider (NEW)
+    # Sidebar: LLM provider
     st.sidebar.header("LLM Provider")
     provider = st.sidebar.selectbox(
         "Choose the LLM to use:",
@@ -230,11 +262,18 @@ def run():
         index=0,
     )
 
-    # Keep legacy Lab2 toggle (applies to OpenAI only)
+    # Anthropic model selection (aliases or explicit ID)
+    anthropic_model_choice = None
+    if provider == "Anthropic (Claude)":
+        anthropic_model_choice = st.sidebar.selectbox(
+            "Anthropic model:",
+            ["sonnet", "haiku", "opus", "claude-3-7-sonnet-20250219"],
+            index=0,
+        )
+
+    # OpenAI model selection (keeps the original Lab 2 behavior)
     st.sidebar.header("Model Options (OpenAI)")
     use_advanced = st.sidebar.checkbox("Use Advanced Model (GPT-4o)")
-
-    # If OpenAI and not advanced, allow model selection (as in Lab2)
     if provider == "OpenAI":
         if use_advanced:
             model = "gpt-4o"
@@ -245,7 +284,7 @@ def run():
                 index=0,
             )
     else:
-        model = None  # not used for non-OpenAI selections
+        model = None  # not used by non-OpenAI branches
 
     # Top-of-screen: URL input
     url = st.text_input(
@@ -281,9 +320,14 @@ def run():
                     if not anthropic_api_key:
                         st.error("Missing ANTHROPIC_API_KEY in Streamlit secrets.")
                         return
-                    if not validate_anthropic_key(anthropic_api_key):
+                    if not anthropic_model_choice:
+                        st.error("Please select an Anthropic model.")
                         return
-                    summarize_with_anthropic(anthropic_api_key, url, content, base_instruction, output_language)
+                    if not validate_anthropic_key(anthropic_api_key, anthropic_model_choice):
+                        return
+                    summarize_with_anthropic(
+                        anthropic_api_key, url, content, base_instruction, output_language, anthropic_model_choice
+                    )
 
                 elif provider == "Google Gemini":
                     if not gemini_api_key:
