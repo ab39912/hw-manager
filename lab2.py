@@ -166,28 +166,28 @@ def summarize_with_anthropic(api_key: str, url: str, content: str, base_instruct
 # ===========================
 # Provider: Google Gemini
 # ===========================
-def validate_gemini_key(api_key: str) -> bool:
+def validate_gemini_key(api_key: str, model_name: str) -> bool:
     if not genai:
         st.error("Google Generative AI SDK is not installed. Add `google-generativeai` to requirements.txt.")
         return False
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel(model_name)
         _ = model.generate_content("Reply with OK")
         return True
     except Exception as e:
-        st.error(f"Gemini key validation failed: {e}")
+        st.error(f"Gemini key/model validation failed: {e}")
         return False
 
-def summarize_with_gemini(api_key: str, url: str, content: str, base_instruction: str, output_language: str):
+def summarize_with_gemini(api_key: str, model_name: str, url: str, content: str, base_instruction: str, output_language: str):
     genai.configure(api_key=api_key)
     prompt = build_task_prompt(url, content, base_instruction, output_language)
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel(model_name)
         resp = model.generate_content(
             f"System instruction: Always answer in {output_language}.\n\n{prompt}"
         )
-        st.subheader(f"Summary (Gemini, Language: {output_language})")
+        st.subheader(f"Summary (Gemini: {model_name}, Language: {output_language})")
         st.write(resp.text)
     except Exception as e:
         st.error(f"Gemini summarization failed: {e}")
@@ -195,28 +195,28 @@ def summarize_with_gemini(api_key: str, url: str, content: str, base_instruction
 # ===========================
 # Provider: Cohere
 # ===========================
-def validate_cohere_key(api_key: str) -> bool:
+def validate_cohere_key(api_key: str, model_name: str) -> bool:
     if not cohere:
         st.error("Cohere SDK is not installed. Add `cohere` to requirements.txt.")
         return False
     try:
         ch = cohere.Client(api_key)
-        _ = ch.chat(message="Reply with OK")
+        _ = ch.chat(model=model_name, message="Reply with OK")
         return True
     except Exception as e:
-        st.error(f"Cohere key validation failed: {e}")
+        st.error(f"Cohere key/model validation failed: {e}")
         return False
 
-def summarize_with_cohere(api_key: str, url: str, content: str, base_instruction: str, output_language: str):
+def summarize_with_cohere(api_key: str, model_name: str, url: str, content: str, base_instruction: str, output_language: str):
     ch = cohere.Client(api_key)
     prompt = build_task_prompt(url, content, base_instruction, output_language)
     try:
         resp = ch.chat(
-            model="command-r-plus",
+            model=model_name,
             message=(f"System: Always respond in {output_language} only.\n\n{prompt}")
         )
         text = resp.text if hasattr(resp, "text") else (resp.output_text if hasattr(resp, "output_text") else str(resp))
-        st.subheader(f"Summary (Cohere, Language: {output_language})")
+        st.subheader(f"Summary (Cohere: {model_name}, Language: {output_language})")
         st.write(text)
     except Exception as e:
         st.error(f"Cohere summarization failed: {e}")
@@ -226,7 +226,7 @@ def summarize_with_cohere(api_key: str, url: str, content: str, base_instruction
 # ===========================
 def run():
     st.title("🔗 Ameya's URL Summarizer (HW 2)")
-    st.write("Enter a URL below, pick your summary style, choose the **LLM provider** (and model, if OpenAI/Anthropic), and select the output language.")
+    st.write("Enter a URL below, pick your summary style, choose the **LLM provider** (and model, if applicable), and select the output language.")
 
     # Load all possible keys from secrets (some may be missing)
     openai_api_key    = st.secrets.get("OPENAI_API_KEY", None)
@@ -268,6 +268,32 @@ def run():
         anthropic_model_choice = st.sidebar.selectbox(
             "Anthropic model:",
             ["sonnet", "haiku", "opus", "claude-3-7-sonnet-20250219"],
+            index=0,
+        )
+
+    # Gemini model selection (NEW)
+    gemini_model_choice = None
+    if provider == "Google Gemini":
+        gemini_model_choice = st.sidebar.selectbox(
+            "Gemini model:",
+            [
+                "gemini-1.5-flash",
+                "gemini-1.5-pro",
+                "gemini-1.0-pro",
+            ],
+            index=0,
+        )
+
+    # Cohere model selection (NEW)
+    cohere_model_choice = None
+    if provider == "Cohere":
+        cohere_model_choice = st.sidebar.selectbox(
+            "Cohere model:",
+            [
+                "command-r-plus",
+                "command-r",
+                "command",
+            ],
             index=0,
         )
 
@@ -334,17 +360,27 @@ def run():
                     if not gemini_api_key:
                         st.error("Missing GEMINI_API_KEY in Streamlit secrets.")
                         return
-                    if not validate_gemini_key(gemini_api_key):
+                    if not gemini_model_choice:
+                        st.error("Please select a Gemini model.")
                         return
-                    summarize_with_gemini(gemini_api_key, url, content, base_instruction, output_language)
+                    if not validate_gemini_key(gemini_api_key, gemini_model_choice):
+                        return
+                    summarize_with_gemini(
+                        gemini_api_key, gemini_model_choice, url, content, base_instruction, output_language
+                    )
 
                 elif provider == "Cohere":
                     if not cohere_api_key:
                         st.error("Missing COHERE_API_KEY in Streamlit secrets.")
                         return
-                    if not validate_cohere_key(cohere_api_key):
+                    if not cohere_model_choice:
+                        st.error("Please select a Cohere model.")
                         return
-                    summarize_with_cohere(cohere_api_key, url, content, base_instruction, output_language)
+                    if not validate_cohere_key(cohere_api_key, cohere_model_choice):
+                        return
+                    summarize_with_cohere(
+                        cohere_api_key, cohere_model_choice, url, content, base_instruction, output_language
+                    )
 
                 else:
                     st.error("Unsupported provider selection.")
