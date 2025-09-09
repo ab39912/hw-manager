@@ -3,7 +3,6 @@ from openai import OpenAI
 import requests
 from bs4 import BeautifulSoup
 
-# Optional provider SDKs (gracefully handled if missing)
 try:
     import anthropic
 except Exception:
@@ -19,9 +18,6 @@ try:
 except Exception:
     cohere = None
 
-# ===========================
-# Anthropic model resolution (UPDATED)
-# ===========================
 ANTHROPIC_MODEL_ALIASES = {
     # ✅ Latest and supported as of 2025:
     "opus":       "claude-opus-4-20250514",       # Opus 4
@@ -80,9 +76,9 @@ def build_task_prompt(url: str, content: str, base_instruction: str, output_lang
         f"URL: {url}\n\nExtracted Text:\n{content}\n"
     )
 
-# ===========================
-# Provider: OpenAI
-# ===========================
+
+# OpenAI
+
 def validate_openai_key(client: OpenAI) -> bool:
     try:
         _ = client.chat.completions.create(
@@ -104,9 +100,9 @@ def summarize_with_openai(client: OpenAI, model: str, url: str, content: str, ba
     st.subheader(f"Summary (OpenAI: {model}, Language: {output_language})")
     st.write_stream(stream)
 
-# ===========================
-# Provider: Anthropic (Claude)
-# ===========================
+
+# Anthropic (Claude)
+
 def validate_anthropic_key(api_key: str, selected_model: str) -> bool:
     if not anthropic:
         st.error("Anthropic SDK is not installed.")
@@ -145,9 +141,9 @@ def summarize_with_anthropic(api_key: str, url: str, content: str, base_instruct
     except Exception as e:
         st.error(f"Claude summarization failed: {e}")
 
-# ===========================
-# Provider: Google Gemini
-# ===========================
+
+# Google Gemini
+
 def validate_gemini_key(api_key: str, model_name: str) -> bool:
     if not genai:
         st.error("Google Generative AI SDK is not installed.")
@@ -172,9 +168,9 @@ def summarize_with_gemini(api_key: str, model_name: str, url: str, content: str,
     except Exception as e:
         st.error(f"Gemini summarization failed: {e}")
 
-# ===========================
-# Provider: Cohere
-# ===========================
+
+# Cohere
+
 def validate_cohere_key(api_key: str, model_name: str) -> bool:
     if not cohere:
         st.error("Cohere SDK is not installed.")
@@ -198,9 +194,9 @@ def summarize_with_cohere(api_key: str, model_name: str, url: str, content: str,
     except Exception as e:
         st.error(f"Cohere summarization failed: {e}")
 
-# ===========================
+
 # App
-# ===========================
+
 def run():
     st.title("🔗 Ameya's URL Summarizer (HW 2)")
     st.write("Enter a URL, choose summary style, provider, and output language.")
@@ -303,5 +299,5 @@ def run():
             except Exception as e:
                 st.error(f"Failed to generate summary: {e}")
 
-# Keep entry point
+
 main = run
