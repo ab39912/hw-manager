@@ -20,25 +20,23 @@ except Exception:
     cohere = None
 
 # ===========================
-# Anthropic model resolution
+# Anthropic model resolution (UPDATED)
 # ===========================
 ANTHROPIC_MODEL_ALIASES = {
     # ✅ Latest and supported as of 2025:
-    "opus":       "claude-opus-4-20250514",       # Opus 4 (general purpose, very capable)
-    "opus-4.1":   "claude-opus-4-1-20250805",     # Opus 4.1 (newer variant, Aug 2025)
-    "sonnet":     "claude-sonnet-4-20250514",     # Sonnet 4 (fast + strong)
+    "opus":       "claude-opus-4-20250514",       # Opus 4
+    "opus-4.1":   "claude-opus-4-1-20250805",     # Opus 4.1 (Aug 2025 release)
+    "sonnet":     "claude-sonnet-4-20250514",     # Sonnet 4
     "sonnet-3.7": "claude-3-7-sonnet-20250219",   # Sonnet 3.7 (Feb 2025 release)
-    "haiku":      "claude-3-5-haiku-20241022",    # Haiku 3.5 (lightweight + fast)
+    "haiku":      "claude-3-5-haiku-20241022",    # Haiku 3.5
 }
 def resolve_anthropic_model(selected: str) -> str:
-    """Resolve friendly aliases to canonical Anthropic model IDs."""
     return ANTHROPIC_MODEL_ALIASES.get(selected, selected)
 
 # ===========================
 # Helpers
 # ===========================
 def read_url_content(url: str):
-    """Fetch a URL and return visible text content."""
     try:
         url = url.strip()
         if not (url.startswith("http://") or url.startswith("https://")):
@@ -68,7 +66,6 @@ def pick_instruction(summary_option: str) -> str:
         return "Summarize the document in 5 clear bullet points."
 
 def trim_for_model(text: str, max_chars: int = 20000) -> str:
-    """Trim overly long content to keep prompt size reasonable."""
     if text and len(text) > max_chars:
         head = text[: max_chars // 2]
         tail = text[-max_chars // 2 :]
@@ -76,7 +73,6 @@ def trim_for_model(text: str, max_chars: int = 20000) -> str:
     return text
 
 def build_task_prompt(url: str, content: str, base_instruction: str, output_language: str) -> str:
-    """Unified task for providers that don't use role messages like OpenAI does."""
     return (
         f"Task: {base_instruction}\n"
         f"Write the entire output in {output_language}. Do not include any other language. "
@@ -101,24 +97,10 @@ def validate_openai_key(client: OpenAI) -> bool:
 
 def summarize_with_openai(client: OpenAI, model: str, url: str, content: str, base_instruction: str, output_language: str):
     messages = [
-        {
-            "role": "system",
-            "content": f"You are a helpful assistant that writes clear, faithful summaries. Always respond in {output_language} only.",
-        },
-        {
-            "role": "user",
-            "content": (
-                f"URL: {url}\n\nExtracted Text:\n{content}\n\n"
-                f"Task: {base_instruction} Write the entire output in {output_language}. "
-                f"Do not include any other languages. If translation is needed, translate as part of the summary."
-            ),
-        },
+        {"role": "system", "content": f"You are a helpful assistant. Always respond in {output_language}."},
+        {"role": "user", "content": f"URL: {url}\n\nExtracted Text:\n{content}\n\nTask: {base_instruction}"}
     ]
-    stream = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        stream=True,
-    )
+    stream = client.chat.completions.create(model=model, messages=messages, stream=True)
     st.subheader(f"Summary (OpenAI: {model}, Language: {output_language})")
     st.write_stream(stream)
 
@@ -127,11 +109,11 @@ def summarize_with_openai(client: OpenAI, model: str, url: str, content: str, ba
 # ===========================
 def validate_anthropic_key(api_key: str, selected_model: str) -> bool:
     if not anthropic:
-        st.error("Anthropic SDK is not installed. Add `anthropic` to requirements.txt.")
+        st.error("Anthropic SDK is not installed.")
         return False
     try:
         model_id = resolve_anthropic_model(selected_model)
-        client = anthropic.Anthropic(api_key=api_key)  # modern SDK
+        client = anthropic.Anthropic(api_key=api_key)
         _ = client.messages.create(
             model=model_id,
             max_tokens=5,
@@ -139,7 +121,7 @@ def validate_anthropic_key(api_key: str, selected_model: str) -> bool:
         )
         return True
     except Exception as e:
-        st.error(f"Anthropic key validation failed: {e}")
+        st.error(f"Anthropic key/model validation failed: {e}")
         return False
 
 def summarize_with_anthropic(api_key: str, url: str, content: str, base_instruction: str, output_language: str, selected_model: str):
@@ -153,14 +135,11 @@ def summarize_with_anthropic(api_key: str, url: str, content: str, base_instruct
             system=f"Always answer in {output_language}.",
             messages=[{"role": "user", "content": prompt}],
         )
-        # Robust extraction of text blocks
         text_chunks = []
         for part in getattr(resp, "content", []) or []:
-            t = getattr(part, "text", None)
-            if t:
-                text_chunks.append(t)
+            if hasattr(part, "text") and part.text:
+                text_chunks.append(part.text)
         text = "".join(text_chunks).strip() or str(resp)
-
         st.subheader(f"Summary (Claude: {model_id}, Language: {output_language})")
         st.write(text)
     except Exception as e:
@@ -171,7 +150,7 @@ def summarize_with_anthropic(api_key: str, url: str, content: str, base_instruct
 # ===========================
 def validate_gemini_key(api_key: str, model_name: str) -> bool:
     if not genai:
-        st.error("Google Generative AI SDK is not installed. Add `google-generativeai` to requirements.txt.")
+        st.error("Google Generative AI SDK is not installed.")
         return False
     try:
         genai.configure(api_key=api_key)
@@ -187,9 +166,7 @@ def summarize_with_gemini(api_key: str, model_name: str, url: str, content: str,
     prompt = build_task_prompt(url, content, base_instruction, output_language)
     try:
         model = genai.GenerativeModel(model_name)
-        resp = model.generate_content(
-            f"System instruction: Always answer in {output_language}.\n\n{prompt}"
-        )
+        resp = model.generate_content(f"System instruction: Always answer in {output_language}.\n\n{prompt}")
         st.subheader(f"Summary (Gemini: {model_name}, Language: {output_language})")
         st.write(resp.text)
     except Exception as e:
@@ -200,7 +177,7 @@ def summarize_with_gemini(api_key: str, model_name: str, url: str, content: str,
 # ===========================
 def validate_cohere_key(api_key: str, model_name: str) -> bool:
     if not cohere:
-        st.error("Cohere SDK is not installed. Add `cohere` to requirements.txt.")
+        st.error("Cohere SDK is not installed.")
         return False
     try:
         ch = cohere.Client(api_key)
@@ -214,11 +191,8 @@ def summarize_with_cohere(api_key: str, model_name: str, url: str, content: str,
     ch = cohere.Client(api_key)
     prompt = build_task_prompt(url, content, base_instruction, output_language)
     try:
-        resp = ch.chat(
-            model=model_name,
-            message=(f"System: Always respond in {output_language} only.\n\n{prompt}")
-        )
-        text = resp.text if hasattr(resp, "text") else (resp.output_text if hasattr(resp, "output_text") else str(resp))
+        resp = ch.chat(model=model_name, message=f"System: Always respond in {output_language}.\n\n{prompt}")
+        text = resp.text if hasattr(resp, "text") else str(resp)
         st.subheader(f"Summary (Cohere: {model_name}, Language: {output_language})")
         st.write(text)
     except Exception as e:
@@ -229,186 +203,105 @@ def summarize_with_cohere(api_key: str, model_name: str, url: str, content: str,
 # ===========================
 def run():
     st.title("🔗 Ameya's URL Summarizer (HW 2)")
-    st.write("Enter a URL below, pick your summary style, choose the **LLM provider** (and model, if applicable), and select the output language.")
+    st.write("Enter a URL, choose summary style, provider, and output language.")
 
-    # Load all possible keys from secrets (some may be missing)
-    openai_api_key    = st.secrets.get("OPENAI_API_KEY", None)
-    anthropic_api_key = st.secrets.get("ANTHROPIC_API_KEY", None)
-    gemini_api_key    = st.secrets.get("GEMINI_API_KEY", None)
-    cohere_api_key    = st.secrets.get("COHERE_API_KEY", None)
+    # Load API keys
+    openai_api_key    = st.secrets.get("OPENAI_API_KEY")
+    anthropic_api_key = st.secrets.get("ANTHROPIC_API_KEY")
+    gemini_api_key    = st.secrets.get("GEMINI_API_KEY")
+    cohere_api_key    = st.secrets.get("COHERE_API_KEY")
 
     # Sidebar: summary options
     st.sidebar.header("Summary Options")
-    summary_option = st.sidebar.radio(
-        "Choose summary style:",
-        [
-            "Summarize in 100 words",
-            "Summarize in 2 connecting paragraphs",
-            "Summarize in 5 bullet points",
-        ],
-        index=0,
-    )
+    summary_option = st.sidebar.radio("Choose summary style:", [
+        "Summarize in 100 words",
+        "Summarize in 2 connecting paragraphs",
+        "Summarize in 5 bullet points",
+    ], index=0)
 
     # Sidebar: output language
     st.sidebar.header("Output Language")
-    output_language = st.sidebar.selectbox(
-        "Select the language to output:",
-        ["English", "French", "Spanish", "German", "Hindi"],
-        index=0,
-    )
+    output_language = st.sidebar.selectbox("Select output language:", ["English", "French", "Spanish", "German", "Hindi"])
 
     # Sidebar: LLM provider
     st.sidebar.header("LLM Provider")
-    provider = st.sidebar.selectbox(
-        "Choose the LLM to use:",
-        ["OpenAI", "Anthropic (Claude)", "Google Gemini", "Cohere"],
-        index=0,
-    )
+    provider = st.sidebar.selectbox("Choose the LLM:", ["OpenAI", "Anthropic (Claude)", "Google Gemini", "Cohere"])
 
-    # Anthropic model selection with ADV toggle
+    # Anthropic
     anthropic_model_choice = None
     if provider == "Anthropic (Claude)":
         st.sidebar.subheader("Anthropic Models")
-        use_adv_claude = st.sidebar.checkbox("Use Advanced Claude (Sonnet/Opus)")
+        use_adv_claude = st.sidebar.checkbox("Use Advanced Claude (Sonnet/Opus family)")
         if use_adv_claude:
-            anthropic_model_choice = st.sidebar.selectbox(
-                "Advanced Claude model:",
-                ["sonnet", "opus"],
-                index=0,
-            )
+            anthropic_model_choice = st.sidebar.selectbox("Advanced Claude model:", ["sonnet", "opus", "opus-4.1", "sonnet-3.7"])
         else:
-            anthropic_model_choice = st.sidebar.selectbox(
-                "Anthropic model:",
-                ["haiku", "sonnet", "opus", "claude-3-7-sonnet-20250219"],
-                index=0,
-            )
+            anthropic_model_choice = st.sidebar.selectbox("Claude model:", ["haiku", "sonnet", "opus", "opus-4.1", "sonnet-3.7"])
 
-    # Gemini model selection with ADV toggle
+    # Gemini
     gemini_model_choice = None
     if provider == "Google Gemini":
         st.sidebar.subheader("Gemini Models")
         use_adv_gemini = st.sidebar.checkbox("Use Advanced Gemini (1.5 Pro)")
         if use_adv_gemini:
-            gemini_model_choice = st.sidebar.selectbox(
-                "Advanced Gemini model:",
-                ["gemini-1.5-pro"],
-                index=0,
-            )
+            gemini_model_choice = "gemini-1.5-pro"
         else:
-            gemini_model_choice = st.sidebar.selectbox(
-                "Gemini model:",
-                [
-                    "gemini-1.5-flash",
-                    "gemini-1.5-pro",
-                    "gemini-1.0-pro",
-                ],
-                index=0,
-            )
+            gemini_model_choice = st.sidebar.selectbox("Gemini model:", ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"])
 
-    # Cohere model selection
+    # Cohere
     cohere_model_choice = None
     if provider == "Cohere":
         st.sidebar.subheader("Cohere Models")
-        cohere_model_choice = st.sidebar.selectbox(
-            "Cohere model:",
-            [
-                "command-r-plus",
-                "command-r",
-                "command",
-            ],
-            index=0,
-        )
+        cohere_model_choice = st.sidebar.selectbox("Cohere model:", ["command-r-plus", "command-r", "command"])
 
-    # -----------------------------
-    # OpenAI model options (shown ONLY when provider == OpenAI)
-    # -----------------------------
+    # OpenAI
     model = None
     if provider == "OpenAI":
         st.sidebar.header("Model Options (OpenAI)")
-        use_advanced = st.sidebar.checkbox("Use Advanced Model (GPT-4o)")
-        if use_advanced:
+        use_adv_openai = st.sidebar.checkbox("Use Advanced Model (GPT-4o)")
+        if use_adv_openai:
             model = "gpt-4o"
         else:
-            model = st.sidebar.selectbox(
-                "Choose OpenAI model:",
-                ["gpt-5-nano", "gpt-5-chat-latest"],
-                index=0,
-            )
+            model = st.sidebar.selectbox("OpenAI model:", ["gpt-5-nano", "gpt-5-chat-latest"])
 
-    # Top-of-screen: URL input
-    url = st.text_input(
-        "Enter a URL to summarize",
-        placeholder="https://example.com/article",
-    )
-
+    # Input URL
+    url = st.text_input("Enter a URL to summarize", placeholder="https://example.com/article")
     summarize_clicked = st.button("Summarize")
 
-    if (url and summarize_clicked) or (url and not summarize_clicked and st.session_state.get("auto_run_once") is None):
-        st.session_state["auto_run_once"] = True
-
-        with st.spinner("Fetching and summarizing the page..."):
+    if url and summarize_clicked:
+        with st.spinner("Fetching and summarizing..."):
             content = read_url_content(url)
             if not content:
                 return
-
             content = trim_for_model(content)
             base_instruction = pick_instruction(summary_option)
 
-            # Route by provider + validate key
             try:
                 if provider == "OpenAI":
-                    if not openai_api_key:
-                        st.error("Missing OPENAI_API_KEY in Streamlit secrets.")
-                        return
-                    openai_client = OpenAI(api_key=openai_api_key)
-                    if not validate_openai_key(openai_client):
-                        return
-                    summarize_with_openai(openai_client, model, url, content, base_instruction, output_language)
+                    if not openai_api_key: return st.error("Missing OPENAI_API_KEY")
+                    client = OpenAI(api_key=openai_api_key)
+                    if not validate_openai_key(client): return
+                    summarize_with_openai(client, model, url, content, base_instruction, output_language)
 
                 elif provider == "Anthropic (Claude)":
-                    if not anthropic_api_key:
-                        st.error("Missing ANTHROPIC_API_KEY in Streamlit secrets.")
-                        return
-                    if not anthropic_model_choice:
-                        st.error("Please select an Anthropic model.")
-                        return
-                    if not validate_anthropic_key(anthropic_api_key, anthropic_model_choice):
-                        return
-                    summarize_with_anthropic(
-                        anthropic_api_key, url, content, base_instruction, output_language, anthropic_model_choice
-                    )
+                    if not anthropic_api_key: return st.error("Missing ANTHROPIC_API_KEY")
+                    if not anthropic_model_choice: return st.error("Select a Claude model")
+                    if not validate_anthropic_key(anthropic_api_key, anthropic_model_choice): return
+                    summarize_with_anthropic(anthropic_api_key, url, content, base_instruction, output_language, anthropic_model_choice)
 
                 elif provider == "Google Gemini":
-                    if not gemini_api_key:
-                        st.error("Missing GEMINI_API_KEY in Streamlit secrets.")
-                        return
-                    if not gemini_model_choice:
-                        st.error("Please select a Gemini model.")
-                        return
-                    if not validate_gemini_key(gemini_api_key, gemini_model_choice):
-                        return
-                    summarize_with_gemini(
-                        gemini_api_key, gemini_model_choice, url, content, base_instruction, output_language
-                    )
+                    if not gemini_api_key: return st.error("Missing GEMINI_API_KEY")
+                    if not gemini_model_choice: return st.error("Select a Gemini model")
+                    if not validate_gemini_key(gemini_api_key, gemini_model_choice): return
+                    summarize_with_gemini(gemini_api_key, gemini_model_choice, url, content, base_instruction, output_language)
 
                 elif provider == "Cohere":
-                    if not cohere_api_key:
-                        st.error("Missing COHERE_API_KEY in Streamlit secrets.")
-                        return
-                    if not cohere_model_choice:
-                        st.error("Please select a Cohere model.")
-                        return
-                    if not validate_cohere_key(cohere_api_key, cohere_model_choice):
-                        return
-                    summarize_with_cohere(
-                        cohere_api_key, cohere_model_choice, url, content, base_instruction, output_language
-                    )
-
-                else:
-                    st.error("Unsupported provider selection.")
+                    if not cohere_api_key: return st.error("Missing COHERE_API_KEY")
+                    if not cohere_model_choice: return st.error("Select a Cohere model")
+                    if not validate_cohere_key(cohere_api_key, cohere_model_choice): return
+                    summarize_with_cohere(cohere_api_key, cohere_model_choice, url, content, base_instruction, output_language)
 
             except Exception as e:
                 st.error(f"Failed to generate summary: {e}")
 
-# Keep the entry point
+# Keep entry point
 main = run
