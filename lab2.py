@@ -23,12 +23,15 @@ except Exception:
 # Anthropic model resolution
 # ===========================
 ANTHROPIC_MODEL_ALIASES = {
-    "sonnet": "claude-3-7-sonnet-20250219",
-    "haiku":  "claude-3-5-haiku-20241022",
-    "opus":   "claude-3-opus-20240229",
+    # ✅ Latest and supported as of 2025:
+    "opus":       "claude-opus-4-20250514",       # Opus 4 (general purpose, very capable)
+    "opus-4.1":   "claude-opus-4-1-20250805",     # Opus 4.1 (newer variant, Aug 2025)
+    "sonnet":     "claude-sonnet-4-20250514",     # Sonnet 4 (fast + strong)
+    "sonnet-3.7": "claude-3-7-sonnet-20250219",   # Sonnet 3.7 (Feb 2025 release)
+    "haiku":      "claude-3-5-haiku-20241022",    # Haiku 3.5 (lightweight + fast)
 }
 def resolve_anthropic_model(selected: str) -> str:
-    """Allow either a friendly alias (sonnet/haiku/opus) or a full Anthropic model ID."""
+    """Resolve friendly aliases to canonical Anthropic model IDs."""
     return ANTHROPIC_MODEL_ALIASES.get(selected, selected)
 
 # ===========================
@@ -266,19 +269,19 @@ def run():
     anthropic_model_choice = None
     if provider == "Anthropic (Claude)":
         st.sidebar.subheader("Anthropic Models")
-        use_adv_claude = st.sidebar.checkbox("Use Advanced Claude (Sonnet/Opus)")
-        if use_adv_claude:
-            anthropic_model_choice = st.sidebar.selectbox(
-                "Advanced Claude model:",
-                ["sonnet", "opus"],
-                index=0,
-            )
-        else:
-            anthropic_model_choice = st.sidebar.selectbox(
-                "Anthropic model:",
-                ["haiku", "sonnet", "opus", "claude-3-7-sonnet-20250219"],
-                index=0,
-            )
+        use_adv_claude = st.sidebar.checkbox("Use Advanced Claude (Sonnet / Opus family)")
+    if use_adv_claude:
+        anthropic_model_choice = st.sidebar.selectbox(
+            "Advanced Claude model:",
+            ["sonnet", "opus", "opus-4.1", "sonnet-3.7"],
+            index=0,
+        )
+    else:
+        anthropic_model_choice = st.sidebar.selectbox(
+            "Claude model:",
+            ["haiku", "sonnet", "opus", "opus-4.1", "sonnet-3.7"],
+            index=0,
+        )
 
     # Gemini model selection with ADV toggle
     gemini_model_choice = None
