@@ -269,19 +269,19 @@ def run():
     anthropic_model_choice = None
     if provider == "Anthropic (Claude)":
         st.sidebar.subheader("Anthropic Models")
-        use_adv_claude = st.sidebar.checkbox("Use Advanced Claude (Sonnet / Opus family)")
-    if use_adv_claude:
-        anthropic_model_choice = st.sidebar.selectbox(
-            "Advanced Claude model:",
-            ["sonnet", "opus", "opus-4.1", "sonnet-3.7"],
-            index=0,
-        )
-    else:
-        anthropic_model_choice = st.sidebar.selectbox(
-            "Claude model:",
-            ["haiku", "sonnet", "opus", "opus-4.1", "sonnet-3.7"],
-            index=0,
-        )
+        use_adv_claude = st.sidebar.checkbox("Use Advanced Claude (Sonnet/Opus)")
+        if use_adv_claude:
+            anthropic_model_choice = st.sidebar.selectbox(
+                "Advanced Claude model:",
+                ["sonnet", "opus"],
+                index=0,
+            )
+        else:
+            anthropic_model_choice = st.sidebar.selectbox(
+                "Anthropic model:",
+                ["haiku", "sonnet", "opus", "claude-3-7-sonnet-20250219"],
+                index=0,
+            )
 
     # Gemini model selection with ADV toggle
     gemini_model_choice = None
