@@ -3,7 +3,7 @@ from openai import OpenAI
 import requests
 from bs4 import BeautifulSoup
 
-# Error Handling for Libraries of LLMS
+# Optional provider SDKs (gracefully handled if missing)
 try:
     import anthropic
 except Exception:
@@ -19,8 +19,9 @@ try:
 except Exception:
     cohere = None
 
-
-# Anthropic model
+# ===========================
+# Anthropic model resolution
+# ===========================
 ANTHROPIC_MODEL_ALIASES = {
     "sonnet": "claude-3-7-sonnet-20250219",
     "haiku":  "claude-3-5-haiku-20241022",
@@ -30,8 +31,9 @@ def resolve_anthropic_model(selected: str) -> str:
     """Allow either a friendly alias (sonnet/haiku/opus) or a full Anthropic model ID."""
     return ANTHROPIC_MODEL_ALIASES.get(selected, selected)
 
-
-# Read URL
+# ===========================
+# Helpers
+# ===========================
 def read_url_content(url: str):
     """Fetch a URL and return visible text content."""
     try:
@@ -79,8 +81,9 @@ def build_task_prompt(url: str, content: str, base_instruction: str, output_lang
         f"URL: {url}\n\nExtracted Text:\n{content}\n"
     )
 
-
-# OpenAI Key Validation
+# ===========================
+# Provider: OpenAI
+# ===========================
 def validate_openai_key(client: OpenAI) -> bool:
     try:
         _ = client.chat.completions.create(
@@ -116,9 +119,9 @@ def summarize_with_openai(client: OpenAI, model: str, url: str, content: str, ba
     st.subheader(f"Summary (OpenAI: {model}, Language: {output_language})")
     st.write_stream(stream)
 
-
-# Anthropic (Claude) Key Validation
-
+# ===========================
+# Provider: Anthropic (Claude)
+# ===========================
 def validate_anthropic_key(api_key: str, selected_model: str) -> bool:
     if not anthropic:
         st.error("Anthropic SDK is not installed. Add `anthropic` to requirements.txt.")
@@ -147,7 +150,7 @@ def summarize_with_anthropic(api_key: str, url: str, content: str, base_instruct
             system=f"Always answer in {output_language}.",
             messages=[{"role": "user", "content": prompt}],
         )
-        
+        # Robust extraction of text blocks
         text_chunks = []
         for part in getattr(resp, "content", []) or []:
             t = getattr(part, "text", None)
@@ -160,9 +163,9 @@ def summarize_with_anthropic(api_key: str, url: str, content: str, base_instruct
     except Exception as e:
         st.error(f"Claude summarization failed: {e}")
 
-
-# Google Gemini Key Validation
-
+# ===========================
+# Provider: Google Gemini
+# ===========================
 def validate_gemini_key(api_key: str, model_name: str) -> bool:
     if not genai:
         st.error("Google Generative AI SDK is not installed. Add `google-generativeai` to requirements.txt.")
@@ -189,8 +192,9 @@ def summarize_with_gemini(api_key: str, model_name: str, url: str, content: str,
     except Exception as e:
         st.error(f"Gemini summarization failed: {e}")
 
-
-#  Cohere Key Validation
+# ===========================
+# Provider: Cohere
+# ===========================
 def validate_cohere_key(api_key: str, model_name: str) -> bool:
     if not cohere:
         st.error("Cohere SDK is not installed. Add `cohere` to requirements.txt.")
@@ -217,14 +221,14 @@ def summarize_with_cohere(api_key: str, model_name: str, url: str, content: str,
     except Exception as e:
         st.error(f"Cohere summarization failed: {e}")
 
-
-# Main App
-
+# ===========================
+# App
+# ===========================
 def run():
     st.title("🔗 Ameya's URL Summarizer (HW 2)")
     st.write("Enter a URL below, pick your summary style, choose the **LLM provider** (and model, if applicable), and select the output language.")
 
-    # Load all possible keys from secrets
+    # Load all possible keys from secrets (some may be missing)
     openai_api_key    = st.secrets.get("OPENAI_API_KEY", None)
     anthropic_api_key = st.secrets.get("ANTHROPIC_API_KEY", None)
     gemini_api_key    = st.secrets.get("GEMINI_API_KEY", None)
@@ -258,31 +262,50 @@ def run():
         index=0,
     )
 
-    # Anthropic model selection 
+    # Anthropic model selection with ADV toggle
     anthropic_model_choice = None
     if provider == "Anthropic (Claude)":
-        anthropic_model_choice = st.sidebar.selectbox(
-            "Anthropic model:",
-            ["sonnet", "haiku", "opus", "claude-3-7-sonnet-20250219"],
-            index=0,
-        )
+        st.sidebar.subheader("Anthropic Models")
+        use_adv_claude = st.sidebar.checkbox("Use Advanced Claude (Sonnet/Opus)")
+        if use_adv_claude:
+            anthropic_model_choice = st.sidebar.selectbox(
+                "Advanced Claude model:",
+                ["sonnet", "opus"],
+                index=0,
+            )
+        else:
+            anthropic_model_choice = st.sidebar.selectbox(
+                "Anthropic model:",
+                ["haiku", "sonnet", "opus", "claude-3-7-sonnet-20250219"],
+                index=0,
+            )
 
-    # Gemini model selection
+    # Gemini model selection with ADV toggle
     gemini_model_choice = None
     if provider == "Google Gemini":
-        gemini_model_choice = st.sidebar.selectbox(
-            "Gemini model:",
-            [
-                "gemini-1.5-flash",
-                "gemini-1.5-pro",
-                "gemini-1.0-pro",
-            ],
-            index=0,
-        )
+        st.sidebar.subheader("Gemini Models")
+        use_adv_gemini = st.sidebar.checkbox("Use Advanced Gemini (1.5 Pro)")
+        if use_adv_gemini:
+            gemini_model_choice = st.sidebar.selectbox(
+                "Advanced Gemini model:",
+                ["gemini-1.5-pro"],
+                index=0,
+            )
+        else:
+            gemini_model_choice = st.sidebar.selectbox(
+                "Gemini model:",
+                [
+                    "gemini-1.5-flash",
+                    "gemini-1.5-pro",
+                    "gemini-1.0-pro",
+                ],
+                index=0,
+            )
 
-    # Cohere model selection 
+    # Cohere model selection
     cohere_model_choice = None
     if provider == "Cohere":
+        st.sidebar.subheader("Cohere Models")
         cohere_model_choice = st.sidebar.selectbox(
             "Cohere model:",
             [
@@ -293,9 +316,9 @@ def run():
             index=0,
         )
 
-    
-    # OpenAI model options 
-    
+    # -----------------------------
+    # OpenAI model options (shown ONLY when provider == OpenAI)
+    # -----------------------------
     model = None
     if provider == "OpenAI":
         st.sidebar.header("Model Options (OpenAI)")
@@ -328,7 +351,7 @@ def run():
             content = trim_for_model(content)
             base_instruction = pick_instruction(summary_option)
 
-            
+            # Route by provider + validate key
             try:
                 if provider == "OpenAI":
                     if not openai_api_key:
@@ -384,5 +407,5 @@ def run():
             except Exception as e:
                 st.error(f"Failed to generate summary: {e}")
 
-
+# Keep the entry point
 main = run
