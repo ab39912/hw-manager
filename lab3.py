@@ -244,7 +244,7 @@ def summarize_gemini(model: str, api_key: str, prompt: str) -> str:
 # UI
 # ---------------------------
 def run():
-    st.title("🧠 Multi-Vendor Streaming Chat with URL Context")
+    st.title("🧠 HW-3: Streaming Chat with URL Context")
     st.caption("Ask a question. Optionally add up to two URLs as references. Pick a model and a memory mode. The answer streams live.")
 
     # --- Sidebar: URLs, model, memory ---
@@ -302,7 +302,8 @@ def run():
 
     # --- Session State ---
     if "messages" not in st.session_state:
-        st.session_state.messages: List[Dict[str, str]] = []
+        st.session_state["messages"] = []  # list[dict[str, str]]
+
     if "summary" not in st.session_state:
         st.session_state.summary = ""
 
