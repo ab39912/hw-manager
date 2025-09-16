@@ -61,8 +61,8 @@ VENDOR_PRESETS = {
         "Flagship": "gpt-5"          # adjust if you use a different flagship
     },
     "Anthropic": {
-        "Budget": "claude-3-5-haiku",   # small/cheap
-        "Flagship": "claude-3-5-sonnet" # strong general-use
+        "Budget": "claude-3-haiku-20240307",   # small/cheap
+        "Flagship": "claude-3-5-sonnet-latest" # strong general-use
     },
     "Google (Gemini)": {
         "Budget": "gemini-1.5-flash",
