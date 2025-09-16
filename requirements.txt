@@ -6,3 +6,4 @@ bs4
 anthropic
 google-generativeai
 cohere
+tiktoken
