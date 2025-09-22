@@ -30,6 +30,9 @@ try:
 except Exception:
     genai = None
 
+# ===== HTTP (for Anthropic /v1/models) =====
+import requests
+
 # ===== Vector DB =====
 try:
     import chromadb
@@ -55,22 +58,6 @@ OPENAI_MODELS = [
     ("gpt-4o",            "OpenAI • gpt-4o"),
 ]
 DEFAULT_MODEL_OPENAI = "gpt-5-chat-latest"
-
-# Claude models (no fallbacks)
-CLAUDE_MODELS = [
-    ("claude-4.1-opus",  "Claude • Opus 4.1"),
-    ("claude-4-sonnet",  "Claude • Sonnet 4"),
-    ("claude-3.5-haiku", "Claude • Haiku 3.5"),
-]
-DEFAULT_MODEL_CLAUDE = "claude-4.1-opus"
-
-# Gemini models (no fallbacks)
-GEMINI_MODELS = [
-    ("gemini-2.5-pro",        "Gemini • 2.5 Pro"),
-    ("gemini-2.5-flash",      "Gemini • 2.5 Flash"),
-    ("gemini-2.5-flash-lite", "Gemini • 2.5 Flash Lite"),
-]
-DEFAULT_MODEL_GEMINI = "gemini-2.5-pro"
 
 DEFAULT_PROVIDER = "OpenAI"
 
@@ -110,6 +97,14 @@ def _get_secret(name: str) -> str | None:
         val = os.getenv(name)
     return val
 
+def _get_secret_multi(names: list[str]) -> tuple[str | None, str | None]:
+    """Return (value, which_name) for the first non-empty key found."""
+    for n in names:
+        v = _get_secret(n)
+        if v:
+            return v, n
+    return None, None
+
 def _pick_bs_parser() -> str:
     """Prefer lxml, then html5lib, then built-in html.parser."""
     try:
@@ -123,6 +118,29 @@ def _pick_bs_parser() -> str:
     except Exception:
         pass
     return "html.parser"
+
+
+# ======================
+# Claude: list models the current API key can actually use
+# ======================
+def list_claude_models(anthropic_key: str) -> list[str]:
+    """Return model IDs available to THIS Anthropic key (no guessing)."""
+    if not anthropic_key:
+        return []
+    try:
+        r = requests.get(
+            "https://api.anthropic.com/v1/models",
+            headers={
+                "x-api-key": anthropic_key,
+                "anthropic-version": "2023-06-01",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return [m.get("id") for m in data.get("data", []) if m.get("id")]
+    except Exception:
+        return []
 
 
 # ======================
@@ -484,10 +502,12 @@ def run():
     st.title("🧠 HW4: HTML RAG Chatbot with Memory")
     st.caption("Persistent ChromaDB from HTML (two chunks per doc), short conversation memory, and provider/model switch.")
 
-    # API keys
+    # API keys (Gemini checks multiple common names)
     openai_key = _get_secret("OPENAI_API_KEY")
     anthropic_key = _get_secret("ANTHROPIC_API_KEY")
-    google_key = _get_secret("GOOGLE_API_KEY")
+    google_key, google_key_name = _get_secret_multi(
+        ["GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_GEMINI_API_KEY"]
+    )
 
     # Sidebar controls
     with st.sidebar:
@@ -512,20 +532,44 @@ def run():
                 index=[m[0] for m in OPENAI_MODELS].index(DEFAULT_MODEL_OPENAI),
             )
         elif provider == "Claude":
-            model = st.selectbox(
-                "Claude model",
-                options=[m[0] for m in CLAUDE_MODELS],
-                format_func=lambda x: dict(CLAUDE_MODELS)[x],
-                index=[m[0] for m in CLAUDE_MODELS].index(DEFAULT_MODEL_CLAUDE),
-            )
+            # Live list from your Anthropic key – avoids 404s from hard-coded names
+            live = list_claude_models(anthropic_key)
+            if live:
+                model = st.selectbox(
+                    "Claude model (from your account)",
+                    options=live,
+                    index=0,
+                    help="Loaded from Anthropic /v1/models for your API key.",
+                )
+            else:
+                st.error("Couldn’t fetch Claude models for this API key. Check the key or network.")
+                st.stop()
         else:  # Gemini
             model = st.selectbox(
                 "Gemini model",
-                options=[m[0] for m in GEMINI_MODELS],
-                format_func=lambda x: dict(GEMINI_MODELS)[x],
-                index=[m[0] for m in GEMINI_MODELS].index(DEFAULT_MODEL_GEMINI),
+                options=[
+                    "gemini-2.5-pro",
+                    "gemini-2.5-flash",
+                    "gemini-2.5-flash-lite",
+                ],
+                index=0,
             )
 
+        st.divider()
+        st.caption("Key status (source name, not the key itself):")
+        cols = st.columns(3)
+        def _ok(label: str): 
+            st.markdown(f"<span style='background:#ecfdf5;color:#065f46;padding:.15rem .4rem;border-radius:.4rem;font-size:.85em;'>{label}</span>", unsafe_allow_html=True)
+        def _warn(label: str): 
+            st.markdown(f"<span style='background:#fffbeb;color:#92400e;padding:.15rem .4rem;border-radius:.4rem;font-size:.85em;'>{label}</span>", unsafe_allow_html=True)
+        with cols[0]:
+            _ok("OpenAI ✓") if openai_key else _warn("OpenAI ✗")
+        with cols[1]:
+            _ok("Claude ✓") if anthropic_key else _warn("Claude ✗")
+        with cols[2]:
+            _ok(f"Gemini ✓ ({google_key_name})") if google_key else _warn("Gemini ✗")
+
+        st.divider()
         use_rag = st.checkbox("Use HTML vector DB (RAG)", value=True)
         st.caption("Memory buffer keeps last 5 Q&A pairs.")
 
@@ -574,7 +618,6 @@ def run():
                     st.error("Missing OPENAI_API_KEY.")
                     return
                 oclient = OpenAI(api_key=openai_key)
-                # If the model isn't available, OpenAI will raise NotFoundError — we surface it.
                 full_answer = st.write_stream(stream_openai_once(oclient, prompt, model))
 
             elif provider == "Claude":
@@ -592,7 +635,7 @@ def run():
                     st.error("google-generativeai package not installed.")
                     return
                 if not google_key:
-                    st.error("Missing GOOGLE_API_KEY.")
+                    st.error("Missing Google Gemini API key. Set one of: GOOGLE_API_KEY, GEMINI_API_KEY, or GOOGLE_GEMINI_API_KEY.")
                     return
                 full_answer = st.write_stream(stream_gemini_once(prompt, model, google_key))
 
@@ -617,4 +660,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
