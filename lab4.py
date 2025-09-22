@@ -74,7 +74,7 @@ SYSTEM_PROMPT = (
 )
 
 # HTML location
-DEFAULT_HTML_DIR = os.path.join("HWs", "hw4_html")
+DEFAULT_HTML_DIR = "hw4_htmls"
 
 # Persistent Chroma on disk (so we only embed once)
 CHROMA_PATH = os.path.join(".chroma_hw4")
