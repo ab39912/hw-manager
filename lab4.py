@@ -76,9 +76,9 @@ ANTHROPIC_MODELS = [
 ]
 
 GOOGLE_MODELS = [
-    "Gemini-2.5-pro",
-    "Gemini-2.5-flash",
-    "Gemini-2.5-flast-lite",  # used exactly as you provided; change to "flash-lite" if needed
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flast-lite",  # used exactly as you provided; change to "flash-lite" if needed
 ]
 
 SYSTEM_PROMPT = (
@@ -135,7 +135,7 @@ def ensure_anthropic():
 def ensure_gemini(model_name: str):
     if model_name not in _gemini_model_cache:
         import google.generativeai as genai
-        genai.configure(api_key=get_secret("GOOGLE_API_KEY", "GOOGLE_APIKEY", "GOOGLE_KEY"))
+        genai.configure(api_key=get_secret("GEMINI_API_KEY"))
         _gemini_model_cache[model_name] = genai.GenerativeModel(model_name)
     return _gemini_model_cache[model_name]
 
