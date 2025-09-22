@@ -555,19 +555,19 @@ def run():
                 index=0,
             )
 
-        st.divider()
-        st.caption("Key status (source name, not the key itself):")
-        cols = st.columns(3)
-        def _ok(label: str): 
-            st.markdown(f"<span style='background:#ecfdf5;color:#065f46;padding:.15rem .4rem;border-radius:.4rem;font-size:.85em;'>{label}</span>", unsafe_allow_html=True)
-        def _warn(label: str): 
-            st.markdown(f"<span style='background:#fffbeb;color:#92400e;padding:.15rem .4rem;border-radius:.4rem;font-size:.85em;'>{label}</span>", unsafe_allow_html=True)
-        with cols[0]:
-            _ok("OpenAI ✓") if openai_key else _warn("OpenAI ✗")
-        with cols[1]:
-            _ok("Claude ✓") if anthropic_key else _warn("Claude ✗")
-        with cols[2]:
-            _ok(f"Gemini ✓ ({google_key_name})") if google_key else _warn("Gemini ✗")
+        #st.divider()
+        #st.caption("Key status (source name, not the key itself):")
+        #cols = st.columns(3)
+        #def _ok(label: str): 
+            #st.markdown(f"<span style='background:#ecfdf5;color:#065f46;padding:.15rem .4rem;border-radius:.4rem;font-size:.85em;'>{label}</span>", unsafe_allow_html=True)
+        #def _warn(label: str): 
+            #st.markdown(f"<span style='background:#fffbeb;color:#92400e;padding:.15rem .4rem;border-radius:.4rem;font-size:.85em;'>{label}</span>", unsafe_allow_html=True)
+        #with cols[0]:
+            #_ok("OpenAI ✓") if openai_key else _warn("OpenAI ✗")
+        #with cols[1]:
+            #_ok("Claude ✓") if anthropic_key else _warn("Claude ✗")
+        #with cols[2]:
+            #_ok(f"Gemini ✓ ({google_key_name})") if google_key else _warn("Gemini ✗")
 
         st.divider()
         use_rag = st.checkbox("Use HTML vector DB (RAG)", value=True)
