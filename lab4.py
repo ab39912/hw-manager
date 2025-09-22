@@ -45,7 +45,7 @@ SYSTEM_PROMPT = (
     "Always write in short, clear sentences."
 )
 
-DEFAULT_PDF_DIR = "lab4_pdfs"
+DEFAULT_PDF_DIR = "hw4_pdfs"
 CHROMA_PATH = ".chroma_lab4"       # persistent directory
 COLLECTION_NAME = "Lab4Collection"
 
