@@ -1,7 +1,7 @@
-# lab4.py
+# hw4.py
 
 # ============================================================
-# SQLite shim: make sure sqlite3 >= 3.35 for Chroma without OS upgrades
+# SQLite shim: ensure sqlite3 >= 3.35 for Chroma without OS upgrades
 # Requires 'pysqlite3-binary' in requirements.txt.
 # ============================================================
 try:
@@ -50,23 +50,23 @@ except Exception:
 # ======================
 # Provider + model choices
 OPENAI_MODELS = [
-    ("gpt-5-nano",  "gpt-5-nano"),
-    ("chat-latest", "gpt-5-chat-latest"),
-    ("gpt-4o",      "gpt-4o"),
+    ("gpt-5-nano",  "OpenAI • gpt-5-nano"),
+    ("chat-latest", "OpenAI • chat-latest"),
+    ("gpt-4o",      "OpenAI • gpt-4o"),
 ]
 CLAUDE_MODELS = [
-    ("claude-4.1-opus",  "Claude-Opus 4.1"),
-    ("claude-4-sonnet",  "Claude-Sonnet 4"),
-    ("claude-3.5-haiku", "Claude-Haiku 3.5"),
+    ("claude-4.1-opus",  "Claude • Opus 4.1"),
+    ("claude-4-sonnet",  "Claude • Sonnet 4"),
+    ("claude-3.5-haiku", "Claude • Haiku 3.5"),
 ]
 GEMINI_MODELS = [
-    ("gemini-2.5-pro",        "Gemini-2.5 Pro"),
-    ("gemini-2.5-flash",      "Gemini-2.5 Flash"),
-    ("gemini-2.5-flash-lite", "Gemini-2.5 Flash Lite"),
+    ("gemini-2.5-pro",        "Gemini • 2.5 Pro"),
+    ("gemini-2.5-flash",      "Gemini • 2.5 Flash"),
+    ("gemini-2.5-flash-lite", "Gemini • 2.5 Flash Lite"),
 ]
 
 DEFAULT_PROVIDER = "OpenAI"
-DEFAULT_MODEL_OPENAI = "gpt-5-nano"
+DEFAULT_MODEL_OPENAI = "chat-latest"
 DEFAULT_MODEL_CLAUDE = "claude-4.1-opus"
 DEFAULT_MODEL_GEMINI = "gemini-2.5-pro"
 
@@ -78,10 +78,13 @@ ANTHROPIC_COMPAT_MAP = {
 }
 
 SYSTEM_PROMPT = (
-    "You are a helpful Course Information Assistant.\n"
-    "When context from course HTML pages is provided, rely on it first and be concise and clear.\n"
-    "If the context seems unrelated or empty, say that you're answering generally.\n"
-    "Always write in short, clear sentences."
+    "You are a campus iSchool helper chatbot. "
+    "Answer in a friendly, succinct, action-oriented style using bullets and short lines. "
+    "When course/org context is provided, rely on it first. "
+    "If something is unknown or missing in the context, say so plainly and suggest the next step "
+    "(e.g., 'check the Engage page', 'email the contact'). "
+    "Prefer bold labels, lists, and compact phrasing; avoid long paragraphs and tables unless asked. "
+    "Cite document names inline in plain text when relevant, like: [Doc: filename.html (part 1)]."
 )
 
 # HTML folder (your repo shows 'hw4_htmls' at root)
@@ -129,10 +132,7 @@ def _pick_bs_parser() -> str:
 # Streaming helpers (ONE write_stream per response)
 # ======================
 def stream_openai_once(client: OpenAI, prompt: str, model: str):
-    """
-    Generator that yields chunks from OpenAI.
-    Call st.write_stream(stream_openai_once(...)) ONCE.
-    """
+    """Generator that yields chunks from OpenAI."""
     msgs = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
@@ -145,7 +145,7 @@ def stream_openai_once(client: OpenAI, prompt: str, model: str):
 
 
 def stream_claude_once(anthropic_client, prompt: str, model: str):
-    """Generator for Claude streaming. Call write_stream once."""
+    """Generator for Claude streaming."""
     try:
         with anthropic_client.messages.stream(
             model=model,
@@ -161,7 +161,7 @@ def stream_claude_once(anthropic_client, prompt: str, model: str):
 
 
 def stream_gemini_once(prompt: str, model: str, google_api_key: str):
-    """Generator for Gemini streaming. Call write_stream once."""
+    """Generator for Gemini streaming."""
     if genai is None:
         yield "[Gemini SDK not installed]"
         return
@@ -418,6 +418,7 @@ def build_unified_prompt(user_query: str, context_block: str) -> str:
       - Short memory transcript (last 5 Q&A)
       - User question
       - Retrieved context (if any)
+      - Style instructions for a chatbot-like answer (bullets & bold)
     """
     mem = get_buffered_history()
     mem_lines = []
@@ -429,17 +430,54 @@ def build_unified_prompt(user_query: str, context_block: str) -> str:
     parts = [f"SYSTEM:\n{SYSTEM_PROMPT}\n"]
     if memory_text:
         parts.append("SHORT MEMORY (last 5 Q&A):\n" + memory_text + "\n")
+    parts.append(
+        "STYLE:\n"
+        "- Use bold lead-ins and bullet points.\n"
+        "- Keep lines short and scannable.\n"
+        "- If info is missing, state it and suggest the next step.\n"
+        "- Include doc citations inline like [Doc: filename (part N)] when you pull facts.\n"
+    )
     parts.append("USER QUESTION:\n" + user_query + "\n")
     if context_block:
         parts.append(
-            "COURSE CONTEXT (from HTML retrieval):\n"
+            "COURSE/ORG CONTEXT (from HTML retrieval):\n"
             "Use this context first. If it doesn't contain the answer, say so and then answer generally.\n"
             "==== CONTEXT START ====\n"
             f"{context_block}\n"
             "==== CONTEXT END ====\n"
-            "Cite the HTML file names (and part numbers) inline where relevant.\n"
         )
     return "\n".join(parts)
+
+
+# ======================
+# Pretty “chatbot answer” renderer
+# ======================
+def render_chatbot_answer(provider: str, model: str, used_docs: list, full_answer: str):
+    """Render a clean, chatbot-style block with a header + the LLM's bulleted answer."""
+    st.markdown(
+        f"""
+<div style="display:flex;gap:.5rem;align-items:center;margin:.5rem 0 1rem 0;">
+  <span style="background:#eef3ff;color:#1f3d99;padding:.25rem .5rem;border-radius:.5rem;font-weight:600;">{provider}</span>
+  <span style="background:#eefaf0;color:#0b5a33;padding:.25rem .5rem;border-radius:.5rem;font-weight:600;">{model}</span>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # RAG state + doc badges
+    if used_docs:
+        badges = " ".join(
+            f"""<span style="display:inline-block;margin:.125rem .25rem .25rem 0;padding:.2rem .45rem;border:1px solid #e5e7eb;border-radius:.5rem;background:#fafafa;color:#333;">
+                {d["filename"]}{f" • part {d['part']}" if d.get("part") else ""}
+                </span>"""
+            for d in used_docs
+        )
+        st.markdown(f"**Using HTML docs (RAG):** {badges}", unsafe_allow_html=True)
+    else:
+        st.markdown("_No RAG context used._")
+
+    # The model’s answer (already bullet-styled via SYSTEM/STYLE)
+    st.markdown(full_answer)
 
 
 # ======================
@@ -533,15 +571,6 @@ def run():
 
     # Assistant reply (ONE write_stream call per provider)
     with st.chat_message("assistant"):
-        header = f"**Provider:** `{provider}`  •  **Model:** `{model}` — "
-        if use_rag and used_docs:
-            labels = [d["filename"] + (f" (part {d['part']})" if d.get("part") else "") for d in used_docs]
-            st.markdown(header + "**Using HTML docs (RAG):** " + ", ".join(labels))
-        elif use_rag and not used_docs:
-            st.markdown(header + "**No relevant HTML context found** — answering generally.")
-        else:
-            st.markdown(header + "**RAG disabled** — answering generally.")
-
         try:
             if provider == "OpenAI":
                 if not openai_key:
@@ -558,7 +587,6 @@ def run():
                     st.error("Missing ANTHROPIC_API_KEY.")
                     return
                 aclient = anthropic.Anthropic(api_key=anthropic_key)
-                # Optional compatibility mapping:
                 model_to_use = ANTHROPIC_COMPAT_MAP.get(model, model)
                 full_answer = st.write_stream(stream_claude_once(aclient, prompt, model_to_use))
 
@@ -575,16 +603,8 @@ def run():
             st.error("Bad request to the provider API. Check model name, quota, or prompt size.")
             return
 
-        # Show short previews inside the chat bubble (transparency)
-        if use_rag and used_docs:
-            previews = []
-            for i, d in enumerate(used_docs, start=1):
-                snippet = (d["snippet"] or "").strip().replace("\n", " ")
-                if len(snippet) > 400:
-                    snippet = snippet[:400].rstrip() + "…"
-                label = d["filename"] + (f" (part {d['part']})" if d.get("part") else "")
-                previews.append(f"**Doc {i}: {label}** — {snippet}")
-            st.markdown("\n\n**Retrieved snippets:**\n\n" + "\n\n".join(previews))
+        # Clean chatbot-style rendering with header + badges + LLM output
+        render_chatbot_answer(provider, model, used_docs, full_answer)
 
     # Save assistant reply and trim memory to last 5 Q&A pairs
     st.session_state.messages.append({"role": "assistant", "content": full_answer})
