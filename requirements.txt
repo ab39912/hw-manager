@@ -10,3 +10,5 @@ tiktoken
 chromadb
 pypdf
 pysqlite3-binary
+beautifulsoup4
+lxml
