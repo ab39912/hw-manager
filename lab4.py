@@ -51,7 +51,7 @@ except Exception:
 # ======================
 # Configuration
 # ======================
-# OpenAI: EXACTLY what you asked for (no fallbacks)
+# OpenAI: ONLY these (no fallbacks)
 OPENAI_MODELS = [
     ("gpt-5-nano",        "OpenAI • gpt-5-nano"),
     ("gpt-5-chat-latest", "OpenAI • gpt-5-chat-latest"),
@@ -62,13 +62,11 @@ DEFAULT_MODEL_OPENAI = "gpt-5-chat-latest"
 DEFAULT_PROVIDER = "OpenAI"
 
 SYSTEM_PROMPT = (
-    "You are a campus iSchool helper chatbot. "
-    "Answer in a friendly, succinct, action-oriented style using bullets and short lines. "
-    "When course/org context is provided, rely on it first. "
-    "If something is unknown or missing in the context, say so plainly and suggest the next step "
-    "(e.g., 'check the Engage page', 'email the contact'). "
-    "Prefer bold labels, lists, and compact phrasing; avoid long paragraphs and tables unless asked. "
-    'Cite document names inline in plain text when relevant, like: [Doc: filename.html (part 1)].'
+    "You are a campus iSchool helper chatbot.\n"
+    "You MUST answer using ONLY the retrieved HTML context provided.\n"
+    "If the context does not contain the answer, say:\n"
+    "\"I couldn't find this in the course/org HTML materials. Please rephrase or ask something else.\"\n"
+    "Style: friendly, succinct, bullet points, short lines, bold labels; cite doc names inline like: [Doc: filename.html (part 1)]."
 )
 
 # HTML folder (repo shows 'hw4_htmls' at root)
@@ -130,10 +128,7 @@ def list_claude_models(anthropic_key: str) -> list[str]:
     try:
         r = requests.get(
             "https://api.anthropic.com/v1/models",
-            headers={
-                "x-api-key": anthropic_key,
-                "anthropic-version": "2023-06-01",
-            },
+            headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01"},
             timeout=10,
         )
         r.raise_for_status()
@@ -429,10 +424,10 @@ def get_buffered_history() -> List[Dict]:
 def build_unified_prompt(user_query: str, context_block: str) -> str:
     """
     Build one prompt usable across providers. Contains:
-      - SYSTEM intent
+      - SYSTEM intent (RAG-ONLY rule)
       - Short memory transcript (last 5 Q&A)
       - User question
-      - Retrieved context (if any)
+      - Retrieved context (required)
       - Style instructions for a chatbot-like answer (bullets & bold)
     """
     mem = get_buffered_history()
@@ -449,18 +444,16 @@ def build_unified_prompt(user_query: str, context_block: str) -> str:
         "STYLE:\n"
         "- Use **bold** lead-ins and bullet points.\n"
         "- Keep lines short and scannable.\n"
-        "- If info is missing, state it and suggest the next step.\n"
-        "- Include doc citations inline like [Doc: filename (part N)] when you pull facts.\n"
+        "- Cite doc names inline like [Doc: filename (part N)].\n"
     )
     parts.append("USER QUESTION:\n" + user_query + "\n")
-    if context_block:
-        parts.append(
-            "COURSE/ORG CONTEXT (from HTML retrieval):\n"
-            "Use this context first. If it doesn't contain the answer, say so and then answer generally.\n"
-            "==== CONTEXT START ====\n"
-            f"{context_block}\n"
-            "==== CONTEXT END ====\n"
-        )
+    # IMPORTANT: We only build prompts when context exists (enforced in run()).
+    parts.append(
+        "RETRIEVED HTML CONTEXT (use ONLY this to answer):\n"
+        "==== CONTEXT START ====\n"
+        f"{context_block}\n"
+        "==== CONTEXT END ====\n"
+    )
     return "\n".join(parts)
 
 
@@ -479,17 +472,14 @@ def render_chatbot_answer(provider: str, model: str, used_docs: list, full_answe
         unsafe_allow_html=True,
     )
 
-    # RAG state + doc badges
-    if used_docs:
-        badges = " ".join(
-            f"""<span style="display:inline-block;margin:.125rem .25rem .25rem 0;padding:.2rem .45rem;border:1px solid #e5e7eb;border-radius:.5rem;background:#fafafa;color:#333;">
-                {d["filename"]}{f" • part {d['part']}" if d.get("part") else ""}
-                </span>"""
-            for d in used_docs
-        )
-        st.markdown(f"**Using HTML docs (RAG):** {badges}", unsafe_allow_html=True)
-    else:
-        st.markdown("_No RAG context used._")
+    # RAG doc badges (required in RAG-only mode)
+    badges = " ".join(
+        f"""<span style="display:inline-block;margin:.125rem .25rem .25rem 0;padding:.2rem .45rem;border:1px solid #e5e7eb;border-radius:.5rem;background:#fafafa;color:#333;">
+            {d["filename"]}{f" • part {d['part']}" if d.get("part") else ""}
+            </span>"""
+        for d in used_docs
+    )
+    st.markdown(f"**HTML sources used:** {badges}", unsafe_allow_html=True)
 
     # The model’s answer (already bullet-styled via SYSTEM/STYLE)
     st.markdown(full_answer)
@@ -499,24 +489,18 @@ def render_chatbot_answer(provider: str, model: str, used_docs: list, full_answe
 # Main UI
 # ======================
 def run():
-    st.title("🧠 HW4: HTML RAG Chatbot with Memory")
-    st.caption("Persistent ChromaDB from HTML (two chunks per doc), short conversation memory, and provider/model switch.")
+    st.title("🧠 HW4: HTML RAG-Only Chatbot with Memory")
+    st.caption("Answers ONLY from your HTML corpus (two chunks per doc). If nothing relevant is found, no answer is produced.")
 
     # API keys (Gemini checks multiple common names)
     openai_key = _get_secret("OPENAI_API_KEY")
     anthropic_key = _get_secret("ANTHROPIC_API_KEY")
-    google_key, google_key_name = _get_secret_multi(
-        ["GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_GEMINI_API_KEY"]
-    )
+    google_key, google_key_name = _get_secret_multi(["GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_GEMINI_API_KEY"])
 
     # Sidebar controls
     with st.sidebar:
         st.header("Vector DB Setup")
-        html_dir = st.text_input(
-            "HTML folder",
-            value=DEFAULT_HTML_DIR,
-            help="Path containing your HTML pages (e.g., 'hw4_htmls').",
-        )
+        html_dir = st.text_input("HTML folder", value=DEFAULT_HTML_DIR, help="Path containing your HTML pages (e.g., 'hw4_htmls').")
         build_now = st.checkbox("Build on load if collection empty", value=True)
 
         st.divider()
@@ -547,31 +531,28 @@ def run():
         else:  # Gemini
             model = st.selectbox(
                 "Gemini model",
-                options=[
-                    "gemini-2.5-pro",
-                    "gemini-2.5-flash",
-                    "gemini-2.5-flash-lite",
-                ],
+                options=["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
                 index=0,
             )
 
-        #st.divider()
-        #st.caption("Key status (source name, not the key itself):")
-        #cols = st.columns(3)
-        #def _ok(label: str): 
-            #st.markdown(f"<span style='background:#ecfdf5;color:#065f46;padding:.15rem .4rem;border-radius:.4rem;font-size:.85em;'>{label}</span>", unsafe_allow_html=True)
-        #def _warn(label: str): 
-            #st.markdown(f"<span style='background:#fffbeb;color:#92400e;padding:.15rem .4rem;border-radius:.4rem;font-size:.85em;'>{label}</span>", unsafe_allow_html=True)
-        #with cols[0]:
-            #_ok("OpenAI ✓") if openai_key else _warn("OpenAI ✗")
-        #with cols[1]:
-            #_ok("Claude ✓") if anthropic_key else _warn("Claude ✗")
-        #with cols[2]:
-            #_ok(f"Gemini ✓ ({google_key_name})") if google_key else _warn("Gemini ✗")
+        # --- Key status badges removed per request ---
+        # (left commented in case you want to re-enable later)
+        # st.divider()
+        # st.caption("Key status (source name, not the key itself):")
+        # cols = st.columns(3)
+        # def _ok(label: str): 
+        #     st.markdown(f"<span style='background:#ecfdf5;color:#065f46;padding:.15rem .4rem;border-radius:.4rem;font-size:.85em;'>{label}</span>", unsafe_allow_html=True)
+        # def _warn(label: str): 
+        #     st.markdown(f"<span style='background:#fffbeb;color:#92400e;padding:.15rem .4rem;border-radius:.4rem;font-size:.85em;'>{label}</span>", unsafe_allow_html=True)
+        # with cols[0]:
+        #     _ok("OpenAI ✓") if openai_key else _warn("OpenAI ✗")
+        # with cols[1]:
+        #     _ok("Claude ✓") if anthropic_key else _warn("Claude ✗")
+        # with cols[2]:
+        #     _ok(f"Gemini ✓ ({google_key_name})") if google_key else _warn("Gemini ✗")
 
         st.divider()
-        use_rag = st.checkbox("Use HTML vector DB (RAG)", value=True)
-        st.caption("Memory buffer keeps last 5 Q&A pairs.")
+        st.markdown("**RAG mode:** Always ON (answers only when HTML context is found).")
 
     # Build vector DB once (needs OpenAI key for embeddings)
     if build_now and not st.session_state.get("HW4_vectorDB_ready", False):
@@ -590,7 +571,7 @@ def run():
             st.markdown(message["content"])
 
     # Chat input
-    user_input = st.chat_input("Ask a course-related question")
+    user_input = st.chat_input("Ask a question (answered ONLY from the HTML corpus)")
     if not user_input:
         return
 
@@ -599,18 +580,27 @@ def run():
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Retrieval
-    used_docs = []
-    context_block = ""
-    if use_rag and openai_key:
-        used_docs, context_block = retrieve_context(user_input, openai_key, html_dir, n_results=TOP_K)
-    elif use_rag and not openai_key:
-        st.info("RAG enabled, but no OPENAI_API_KEY set for embeddings. Proceeding without RAG.")
+    # Mandatory retrieval (RAG ONLY)
+    if not openai_key:
+        with st.chat_message("assistant"):
+            st.error("RAG requires embeddings. Please set OPENAI_API_KEY to build and query the HTML vector DB.")
+        st.session_state.messages.append({"role": "assistant", "content": "RAG requires embeddings. Set OPENAI_API_KEY."})
+        return
 
-    # Build unified prompt with memory + context
+    used_docs, context_block = retrieve_context(user_input, openai_key, html_dir, n_results=TOP_K)
+
+    # If no context → do NOT answer
+    if not used_docs or not context_block.strip():
+        with st.chat_message("assistant"):
+            msg = "I couldn't find this in the course/org HTML materials. Please rephrase or ask something else."
+            st.warning(msg)
+        st.session_state.messages.append({"role": "assistant", "content": "Couldn't find relevant RAG context."})
+        return
+
+    # Build unified prompt with memory + REQUIRED context
     prompt = build_unified_prompt(user_input, context_block)
 
-    # Assistant reply (ONE write_stream call per provider; NO FALLBACKS)
+    # Assistant reply (ONE write_stream call per provider; NO FALLBACKS; RAG-only)
     with st.chat_message("assistant"):
         try:
             if provider == "OpenAI":
@@ -624,10 +614,10 @@ def run():
                 if anthropic is None:
                     st.error("anthropic package not installed.")
                     return
-                if not anthropic_key:
+                if not _get_secret("ANTHROPIC_API_KEY"):
                     st.error("Missing ANTHROPIC_API_KEY.")
                     return
-                aclient = anthropic.Anthropic(api_key=anthropic_key)
+                aclient = anthropic.Anthropic(api_key=_get_secret("ANTHROPIC_API_KEY"))
                 full_answer = st.write_stream(stream_claude_once(aclient, prompt, model))
 
             else:  # Gemini
@@ -646,7 +636,7 @@ def run():
             st.error(f"Bad request to the provider API. Check model name, quota, or prompt size.\n\n{e}")
             return
 
-        # Clean chatbot-style rendering with header + badges + LLM output
+        # Chatbot-style rendering with required RAG sources
         render_chatbot_answer(provider, model, used_docs, full_answer)
 
     # Save assistant reply and trim memory to last 5 Q&A pairs
