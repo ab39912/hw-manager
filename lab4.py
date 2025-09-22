@@ -1,5 +1,9 @@
-# HW4.py
+# lab4.py
 
+# ============================================================
+# SQLite shim: make sure sqlite3 >= 3.35 for Chroma without OS upgrades
+# Requires 'pysqlite3-binary' in requirements.txt.
+# ============================================================
 try:
     import pysqlite3  # modern SQLite packaged wheel
     import sys as _sys
@@ -15,7 +19,7 @@ from typing import List, Tuple, Dict
 
 import streamlit as st
 
-# --- LLM SDKs ---
+# ===== LLM SDKs =====
 from openai import OpenAI, BadRequestError
 try:
     import anthropic  # Claude
@@ -26,7 +30,7 @@ try:
 except Exception:
     genai = None
 
-# --- Vector DB ---
+# ===== Vector DB =====
 try:
     import chromadb
     from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
@@ -34,7 +38,7 @@ except Exception:
     chromadb = None
     OpenAIEmbeddingFunction = None
 
-# --- HTML parsing ---
+# ===== HTML parsing =====
 try:
     from bs4 import BeautifulSoup
 except Exception:
@@ -42,32 +46,36 @@ except Exception:
 
 
 # ======================
-# App / RAG configuration
+# Configuration
 # ======================
 # Provider + model choices
 OPENAI_MODELS = [
-    ("gpt-5-nano",  "gpt-5-nano"),   # included by request (may not be enabled on all accounts)
-    ("chat-latest", "gpt5-chat-latest"),
+    ("gpt-5-nano",  "gpt-5-nano"),
+    ("chat-latest", "gpt-5-chat-latest"),
     ("gpt-4o",      "gpt-4o"),
 ]
-
 CLAUDE_MODELS = [
-    ("claude-4.1-opus",   "Claude-Opus 4.1"),
-    ("claude-4-sonnet",   "Claude-Sonnet 4"),
-    ("claude-3.5-haiku",  "Claude-Haiku 3.5"),
+    ("claude-4.1-opus",  "Claude-Opus 4.1"),
+    ("claude-4-sonnet",  "Claude-Sonnet 4"),
+    ("claude-3.5-haiku", "Claude-Haiku 3.5"),
 ]
-
 GEMINI_MODELS = [
-    ("gemini-2.5-pro",       "Gemini-2.5 Pro"),
-    ("gemini-2.5-flash",     "Gemini-2.5 Flash"),
-    ("gemini-2.5-flash-lite","Gemini-2.5 Flash Lite"),
+    ("gemini-2.5-pro",        "Gemini-2.5 Pro"),
+    ("gemini-2.5-flash",      "Gemini-2.5 Flash"),
+    ("gemini-2.5-flash-lite", "Gemini-2.5 Flash Lite"),
 ]
-
 
 DEFAULT_PROVIDER = "OpenAI"
 DEFAULT_MODEL_OPENAI = "gpt-5-nano"
 DEFAULT_MODEL_CLAUDE = "claude-4.1-opus"
-DEFAULT_MODEL_GEMINI = "gemini-2.5-flash"
+DEFAULT_MODEL_GEMINI = "gemini-2.5-pro"
+
+# Optional compatibility map in case your Anthropic project doesn't have the new aliases yet
+ANTHROPIC_COMPAT_MAP = {
+    "claude-4.1-opus":  "claude-3-opus-latest",
+    "claude-4-sonnet":  "claude-3-5-sonnet-latest",
+    "claude-3.5-haiku": "claude-3-5-haiku-latest",
+}
 
 SYSTEM_PROMPT = (
     "You are a helpful Course Information Assistant.\n"
@@ -76,23 +84,21 @@ SYSTEM_PROMPT = (
     "Always write in short, clear sentences."
 )
 
-# HTML location
+# HTML folder (your repo shows 'hw4_htmls' at root)
 DEFAULT_HTML_DIR = "hw4_htmls"
 
 # Persistent Chroma on disk (so we only embed once)
-CHROMA_PATH = os.path.join(".chroma_hw4")
+CHROMA_PATH = ".chroma_hw4"
 COLLECTION_NAME = "HW4Collection"
 
-# Retrieval
+# Retrieval & memory
 TOP_K = 3
-SNIPPET_CHARS = 1000      # cap snippet length per retrieved mini-doc sent to LLM
-
-# Memory buffer (last 5 Q&A pairs => ~10 messages)
-MAX_QA_PAIRS = 5
+SNIPPET_CHARS = 1000
+MAX_QA_PAIRS = 5  # memory buffer: last 5 Q&A pairs
 
 
 # ======================
-# Utility: robust API key loader
+# Utilities
 # ======================
 def _get_secret(name: str) -> str | None:
     val = None
@@ -104,33 +110,42 @@ def _get_secret(name: str) -> str | None:
         val = os.getenv(name)
     return val
 
+def _pick_bs_parser() -> str:
+    """Prefer lxml, then html5lib, then built-in html.parser."""
+    try:
+        import lxml  # noqa
+        return "lxml"
+    except Exception:
+        pass
+    try:
+        import html5lib  # noqa
+        return "html5lib"
+    except Exception:
+        pass
+    return "html.parser"
+
 
 # ======================
-# Chat streaming helpers (per provider)
+# Streaming helpers (ONE write_stream per response)
 # ======================
-def stream_openai(client: OpenAI, prompt: str, model: str):
-    """Stream a single-prompt chat from OpenAI."""
-    # Send as system+user for slightly better control
+def stream_openai_once(client: OpenAI, prompt: str, model: str):
+    """
+    Generator that yields chunks from OpenAI.
+    Call st.write_stream(stream_openai_once(...)) ONCE.
+    """
     msgs = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
     ]
     stream = client.chat.completions.create(model=model, messages=msgs, stream=True)
-    full = ""
     for chunk in stream:
         delta = chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else None
         if delta:
-            full += delta
             yield delta
-    stream.full_text = full  # type: ignore
 
 
-def stream_claude(anthropic_client, prompt: str, model: str):
-    """
-    Stream a single-prompt chat from Anthropic Claude.
-    We pass our SYSTEM_PROMPT as system; prompt is user content.
-    """
-    full = ""
+def stream_claude_once(anthropic_client, prompt: str, model: str):
+    """Generator for Claude streaming. Call write_stream once."""
     try:
         with anthropic_client.messages.stream(
             model=model,
@@ -140,51 +155,39 @@ def stream_claude(anthropic_client, prompt: str, model: str):
         ) as stream:
             for event in stream:
                 if event.type == "content_block_delta" and getattr(event.delta, "text", None):
-                    full += event.delta.text
                     yield event.delta.text
-            stream.final_text = full  # type: ignore
     except Exception as e:
-        # Surface a short error; Claude SDK tends to raise descriptive messages
         yield f"\n\n[Claude error: {e}]"
 
 
-def stream_gemini(prompt: str, model: str, google_api_key: str):
-    """
-    Stream a single-prompt chat from Google Gemini.
-    We'll pass a single text that contains system + memory + context.
-    """
+def stream_gemini_once(prompt: str, model: str, google_api_key: str):
+    """Generator for Gemini streaming. Call write_stream once."""
     if genai is None:
         yield "[Gemini SDK not installed]"
         return
     genai.configure(api_key=google_api_key)
-    # Gemini supports system_instruction, but for portability we fold everything into the prompt
     gmodel = genai.GenerativeModel(model_name=model)
     try:
         responses = gmodel.generate_content(prompt, stream=True)
-        full = ""
         for r in responses:
             if hasattr(r, "text") and r.text:
-                full += r.text
                 yield r.text
-        responses.final_text = full  # type: ignore
     except Exception as e:
         yield f"\n\n[Gemini error: {e}]"
 
 
 # ======================
-# Vector DB (Chroma) helpers
+# Vector DB (Chroma)
 # ======================
 def _embedding_fn(openai_api_key: str):
     if OpenAIEmbeddingFunction is None:
         raise RuntimeError("Missing dependency: chromadb. Please install it.")
     return OpenAIEmbeddingFunction(api_key=openai_api_key, model_name="text-embedding-3-small")
 
-
 def _client():
     if chromadb is None:
         raise RuntimeError("Missing dependency: chromadb. Please install it.")
     return chromadb.PersistentClient(path=st.session_state.get("HW4_chroma_path", CHROMA_PATH))
-
 
 def _get_or_create_collection(openai_api_key: str):
     client = _client()
@@ -212,7 +215,10 @@ def _get_or_create_collection(openai_api_key: str):
 # HTML → EXACTLY TWO CHUNKS each
 # ======================
 def _html_file_to_text(path: str) -> str:
-    """Extract readable text from one HTML file (drop scripts/styles/nav/etc)."""
+    """
+    Extract readable text from one HTML file (drop scripts/styles/nav/etc).
+    Uses a parser fallback: lxml → html5lib → html.parser.
+    """
     if BeautifulSoup is None:
         raise RuntimeError("Missing dependency: beautifulsoup4. Please install it.")
     try:
@@ -221,7 +227,8 @@ def _html_file_to_text(path: str) -> str:
     except Exception as e:
         raise RuntimeError(f"Failed to read HTML '{path}': {e}")
 
-    soup = BeautifulSoup(html, "lxml")
+    parser = _pick_bs_parser()
+    soup = BeautifulSoup(html, parser)
     for t in soup(["script", "style", "noscript", "header", "footer", "nav"]):
         t.extract()
     text = soup.get_text(separator="\n")
@@ -233,15 +240,15 @@ def _html_file_to_text(path: str) -> str:
 def _two_balanced_chunks(text: str) -> List[str]:
     """
     >>> CHUNKING STRATEGY (exactly TWO mini-docs per HTML file) <<<
-    We split each document into TWO approximately equal chunks by character count,
-    but we try to cut at a *natural paragraph boundary* (double newline) near the midpoint.
+    Split near the midpoint by character count, but cut at a *paragraph boundary*
+    (double newline) closest to the middle so we avoid splitting sentences.
 
     WHY this method?
-      - Deterministic & simple: exactly two chunks per doc.
-      - Balanced context sizes help the retriever treat parts fairly.
-      - Paragraph-aware cut reduces mid-sentence breaks → cleaner snippets.
+      - Deterministic & simple: consistently two chunks per doc.
+      - Balanced: similar sizes help retrieval.
+      - Paragraph-aware: cleaner snippets and better semantic coherence.
 
-    If no clear paragraph split exists, we fall back to a naive 50/50 split.
+    Fallback: if no clear paragraphs or very short text, do a naive 50/50 split.
     """
     if not text:
         return []
@@ -253,7 +260,7 @@ def _two_balanced_chunks(text: str) -> List[str]:
     cum = 0
     mids = []
     for p in paragraphs:
-        cum += len(p) + 2  # +2 for the paragraph gap removed earlier
+        cum += len(p) + 2  # +2 accounts for the removed '\n\n'
         mids.append(cum)
     target = len(text) // 2
     cut_idx = min(range(len(mids)), key=lambda i: abs(mids[i] - target))
@@ -285,10 +292,10 @@ def _html_to_two_chunks_with_meta(path: str) -> List[Tuple[str, Dict]]:
 
 
 # ======================
-# Build collection once (idempotent)
+# Build vector DB once (idempotent)
 # ======================
 def initialize_hw4_vector_db(html_dir: str, openai_api_key: str):
-    """Create/populate the HW4 Chroma collection only if missing/empty."""
+    """Create/populate the Chroma collection only if missing/empty."""
     if chromadb is None or OpenAIEmbeddingFunction is None:
         st.error("Missing dependency: chromadb.")
         st.stop()
@@ -326,7 +333,7 @@ def initialize_hw4_vector_db(html_dir: str, openai_api_key: str):
     metas: List[Dict] = []
 
     for path in html_paths:
-        pairs = _html_to_two_chunks_with_meta(path)
+        pairs = _html_to_two_chunks_with_meta(path)  # EXACTLY TWO per file
         if not pairs:
             st.warning(f"HTML '{os.path.basename(path)}' produced no text; skipping.")
             continue
@@ -343,7 +350,7 @@ def initialize_hw4_vector_db(html_dir: str, openai_api_key: str):
     try:
         collection.add(ids=ids, documents=docs, metadatas=metas)
     except Exception as e:
-        st.error(f"Failed creating the HW4 vector DB: {e}")
+        st.error(f"Failed creating the vector DB: {e}")
         st.stop()
 
     st.session_state["HW4_vectorDB_ready"] = True
@@ -390,9 +397,7 @@ def retrieve_context(query: str, openai_api_key: str, html_dir: str, n_results: 
 # Memory buffer (last 5 Q&A pairs)
 # ======================
 def get_buffered_history() -> List[Dict]:
-    """
-    Returns up to the last 5 Q&A pairs (10 messages) from st.session_state.messages.
-    """
+    """Return up to the last 5 Q&A pairs (10 messages)."""
     full = st.session_state.get("messages", [])
     user_idxs = [i for i, m in enumerate(full) if m["role"] == "user"]
     keep_user = user_idxs[-MAX_QA_PAIRS:]
@@ -408,14 +413,12 @@ def get_buffered_history() -> List[Dict]:
 
 def build_unified_prompt(user_query: str, context_block: str) -> str:
     """
-    Build a single text prompt usable across providers.
-    Includes:
-      - System intent
+    Build one prompt usable across providers. Contains:
+      - SYSTEM intent
       - Short memory transcript (last 5 Q&A)
-      - Current user question
+      - User question
       - Retrieved context (if any)
     """
-    # Memory transcript as compact Q/A list
     mem = get_buffered_history()
     mem_lines = []
     for m in mem:
@@ -434,30 +437,30 @@ def build_unified_prompt(user_query: str, context_block: str) -> str:
             "==== CONTEXT START ====\n"
             f"{context_block}\n"
             "==== CONTEXT END ====\n"
-            "Cite the HTML file names (and part numbers) inline in plain text where relevant.\n"
+            "Cite the HTML file names (and part numbers) inline where relevant.\n"
         )
     return "\n".join(parts)
 
 
 # ======================
-# Main UI (RAG + memory chat w/ provider switch)
+# Main UI
 # ======================
 def run():
-    st.title("🧠 HW4: HTML RAG Chatbot with Memory")
-    st.caption("Builds a persistent ChromaDB from HTML (two chunks per doc), keeps a 5-pair memory buffer, and lets you choose the LLM provider & model.")
+    st.title("🧠 Lab 4: HTML RAG Chatbot with Memory")
+    st.caption("Persistent ChromaDB from HTML (two chunks per doc), short conversation memory, and provider/model switch.")
 
-    # --- API keys (any providers you plan to use) ---
+    # API keys
     openai_key = _get_secret("OPENAI_API_KEY")
     anthropic_key = _get_secret("ANTHROPIC_API_KEY")
     google_key = _get_secret("GOOGLE_API_KEY")
 
-    # Sidebar: Vector DB & Provider/Model selection
+    # Sidebar controls
     with st.sidebar:
         st.header("Vector DB Setup")
         html_dir = st.text_input(
             "HTML folder",
             value=DEFAULT_HTML_DIR,
-            help="Copy all supplied HTML pages into this folder (e.g., HWs/hw4_html/).",
+            help="Path containing your HTML pages (e.g., 'hw4_htmls').",
         )
         build_now = st.checkbox("Build on load if collection empty", value=True)
 
@@ -491,15 +494,14 @@ def run():
         use_rag = st.checkbox("Use HTML vector DB (RAG)", value=True)
         st.caption("Memory buffer keeps last 5 Q&A pairs.")
 
-    # Build vector DB once
-    # (Requires OpenAI key for embeddings)
+    # Build vector DB once (needs OpenAI key for embeddings)
     if build_now and not st.session_state.get("HW4_vectorDB_ready", False):
         if not openai_key:
-            st.warning("OpenAI key required to build embeddings for the vector DB. Add OPENAI_API_KEY to secrets or environment.")
+            st.warning("OpenAI key required to build embeddings for the vector DB. Add OPENAI_API_KEY.")
         else:
             initialize_hw4_vector_db(html_dir, openai_key)
 
-    # Chat UI
+    # Chat transcript state
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
@@ -508,28 +510,28 @@ def run():
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # Input
+    # Chat input
     user_input = st.chat_input("Ask a course-related question")
     if not user_input:
         return
 
-    # Append user
+    # Append & render user message
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # RAG retrieve (if enabled)
+    # Retrieval
     used_docs = []
     context_block = ""
     if use_rag and openai_key:
         used_docs, context_block = retrieve_context(user_input, openai_key, html_dir, n_results=TOP_K)
     elif use_rag and not openai_key:
-        st.info("RAG is enabled, but you have no OPENAI_API_KEY set for embeddings. Proceeding without RAG.")
+        st.info("RAG enabled, but no OPENAI_API_KEY set for embeddings. Proceeding without RAG.")
 
-    # Unified prompt for cross-provider use
+    # Build unified prompt with memory + context
     prompt = build_unified_prompt(user_input, context_block)
 
-    # Answer with selected provider
+    # Assistant reply (ONE write_stream call per provider)
     with st.chat_message("assistant"):
         header = f"**Provider:** `{provider}`  •  **Model:** `{model}` — "
         if use_rag and used_docs:
@@ -540,17 +542,14 @@ def run():
         else:
             st.markdown(header + "**RAG disabled** — answering generally.")
 
-        # Stream by provider
-        full_answer = ""
         try:
             if provider == "OpenAI":
                 if not openai_key:
                     st.error("Missing OPENAI_API_KEY.")
                     return
                 oclient = OpenAI(api_key=openai_key)
-                for delta in stream_openai(oclient, prompt, model):
-                    full_answer += delta
-                    st.write_stream(lambda: iter([delta]))
+                full_answer = st.write_stream(stream_openai_once(oclient, prompt, model))
+
             elif provider == "Claude":
                 if anthropic is None:
                     st.error("anthropic package not installed.")
@@ -559,9 +558,10 @@ def run():
                     st.error("Missing ANTHROPIC_API_KEY.")
                     return
                 aclient = anthropic.Anthropic(api_key=anthropic_key)
-                for delta in stream_claude(aclient, prompt, model):
-                    full_answer += delta
-                    st.write_stream(lambda: iter([delta]))
+                # Optional compatibility mapping:
+                model_to_use = ANTHROPIC_COMPAT_MAP.get(model, model)
+                full_answer = st.write_stream(stream_claude_once(aclient, prompt, model_to_use))
+
             else:  # Gemini
                 if genai is None:
                     st.error("google-generativeai package not installed.")
@@ -569,14 +569,13 @@ def run():
                 if not google_key:
                     st.error("Missing GOOGLE_API_KEY.")
                     return
-                for delta in stream_gemini(prompt, model, google_key):
-                    full_answer += delta
-                    st.write_stream(lambda: iter([delta]))
+                full_answer = st.write_stream(stream_gemini_once(prompt, model, google_key))
+
         except BadRequestError:
             st.error("Bad request to the provider API. Check model name, quota, or prompt size.")
             return
 
-        # Show short previews of retrieved snippets in the chat bubble
+        # Show short previews inside the chat bubble (transparency)
         if use_rag and used_docs:
             previews = []
             for i, d in enumerate(used_docs, start=1):
