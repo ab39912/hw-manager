@@ -20,7 +20,7 @@ from typing import List, Tuple, Dict
 import streamlit as st
 
 # ===== LLM SDKs =====
-from openai import OpenAI, BadRequestError
+from openai import OpenAI, BadRequestError, NotFoundError
 try:
     import anthropic  # Claude
 except Exception:
@@ -48,34 +48,31 @@ except Exception:
 # ======================
 # Configuration
 # ======================
-# Provider + model choices
+# OpenAI: EXACTLY what you asked for (no fallbacks)
 OPENAI_MODELS = [
-    ("gpt-5-nano",  "OpenAI • gpt-5-nano"),
-    ("chat-latest", "OpenAI • chat-latest"),
-    ("gpt-4o",      "OpenAI • gpt-4o"),
+    ("gpt-5-nano",        "OpenAI • gpt-5-nano"),
+    ("gpt-5-chat-latest", "OpenAI • gpt-5-chat-latest"),
+    ("gpt-4o",            "OpenAI • gpt-4o"),
 ]
+DEFAULT_MODEL_OPENAI = "gpt-5-chat-latest"
+
+# Claude models (no fallbacks)
 CLAUDE_MODELS = [
     ("claude-4.1-opus",  "Claude • Opus 4.1"),
     ("claude-4-sonnet",  "Claude • Sonnet 4"),
     ("claude-3.5-haiku", "Claude • Haiku 3.5"),
 ]
+DEFAULT_MODEL_CLAUDE = "claude-4.1-opus"
+
+# Gemini models (no fallbacks)
 GEMINI_MODELS = [
     ("gemini-2.5-pro",        "Gemini • 2.5 Pro"),
     ("gemini-2.5-flash",      "Gemini • 2.5 Flash"),
     ("gemini-2.5-flash-lite", "Gemini • 2.5 Flash Lite"),
 ]
-
-DEFAULT_PROVIDER = "OpenAI"
-DEFAULT_MODEL_OPENAI = "chat-latest"
-DEFAULT_MODEL_CLAUDE = "claude-4.1-opus"
 DEFAULT_MODEL_GEMINI = "gemini-2.5-pro"
 
-# Optional compatibility map in case your Anthropic project doesn't have the new aliases yet
-ANTHROPIC_COMPAT_MAP = {
-    "claude-4.1-opus":  "claude-3-opus-latest",
-    "claude-4-sonnet":  "claude-3-5-sonnet-latest",
-    "claude-3.5-haiku": "claude-3-5-haiku-latest",
-}
+DEFAULT_PROVIDER = "OpenAI"
 
 SYSTEM_PROMPT = (
     "You are a campus iSchool helper chatbot. "
@@ -84,10 +81,10 @@ SYSTEM_PROMPT = (
     "If something is unknown or missing in the context, say so plainly and suggest the next step "
     "(e.g., 'check the Engage page', 'email the contact'). "
     "Prefer bold labels, lists, and compact phrasing; avoid long paragraphs and tables unless asked. "
-    "Cite document names inline in plain text when relevant, like: [Doc: filename.html (part 1)]."
+    'Cite document names inline in plain text when relevant, like: [Doc: filename.html (part 1)].'
 )
 
-# HTML folder (your repo shows 'hw4_htmls' at root)
+# HTML folder (repo shows 'hw4_htmls' at root)
 DEFAULT_HTML_DIR = "hw4_htmls"
 
 # Persistent Chroma on disk (so we only embed once)
@@ -432,7 +429,7 @@ def build_unified_prompt(user_query: str, context_block: str) -> str:
         parts.append("SHORT MEMORY (last 5 Q&A):\n" + memory_text + "\n")
     parts.append(
         "STYLE:\n"
-        "- Use bold lead-ins and bullet points.\n"
+        "- Use **bold** lead-ins and bullet points.\n"
         "- Keep lines short and scannable.\n"
         "- If info is missing, state it and suggest the next step.\n"
         "- Include doc citations inline like [Doc: filename (part N)] when you pull facts.\n"
@@ -484,7 +481,7 @@ def render_chatbot_answer(provider: str, model: str, used_docs: list, full_answe
 # Main UI
 # ======================
 def run():
-    st.title("🧠 Lab 4: HTML RAG Chatbot with Memory")
+    st.title("🧠 HW4: HTML RAG Chatbot with Memory")
     st.caption("Persistent ChromaDB from HTML (two chunks per doc), short conversation memory, and provider/model switch.")
 
     # API keys
@@ -569,7 +566,7 @@ def run():
     # Build unified prompt with memory + context
     prompt = build_unified_prompt(user_input, context_block)
 
-    # Assistant reply (ONE write_stream call per provider)
+    # Assistant reply (ONE write_stream call per provider; NO FALLBACKS)
     with st.chat_message("assistant"):
         try:
             if provider == "OpenAI":
@@ -577,6 +574,7 @@ def run():
                     st.error("Missing OPENAI_API_KEY.")
                     return
                 oclient = OpenAI(api_key=openai_key)
+                # If the model isn't available, OpenAI will raise NotFoundError — we surface it.
                 full_answer = st.write_stream(stream_openai_once(oclient, prompt, model))
 
             elif provider == "Claude":
@@ -587,8 +585,7 @@ def run():
                     st.error("Missing ANTHROPIC_API_KEY.")
                     return
                 aclient = anthropic.Anthropic(api_key=anthropic_key)
-                model_to_use = ANTHROPIC_COMPAT_MAP.get(model, model)
-                full_answer = st.write_stream(stream_claude_once(aclient, prompt, model_to_use))
+                full_answer = st.write_stream(stream_claude_once(aclient, prompt, model))
 
             else:  # Gemini
                 if genai is None:
@@ -599,8 +596,11 @@ def run():
                     return
                 full_answer = st.write_stream(stream_gemini_once(prompt, model, google_key))
 
-        except BadRequestError:
-            st.error("Bad request to the provider API. Check model name, quota, or prompt size.")
+        except NotFoundError:
+            st.error(f"The selected model `{model}` was not found or is not enabled for this project.")
+            return
+        except BadRequestError as e:
+            st.error(f"Bad request to the provider API. Check model name, quota, or prompt size.\n\n{e}")
             return
 
         # Clean chatbot-style rendering with header + badges + LLM output
@@ -617,3 +617,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+
