@@ -52,8 +52,9 @@ OPENAI_MODELS = [
 ]
 
 CLAUDE_MODELS = [
-    ("claude-3-5-sonnet-latest", "Claude-3.5 Sonnet"),
-    ("claude-3-opus-latest",     "Claude-3 Opus"),
+    ("claude-4.1-opus",   "Claude-Opus 4.1"),
+    ("claude-4-sonnet",   "Claude-Sonnet 4"),
+    ("claude-3.5-haiku",  "Claude-Haiku 3.5"),
 ]
 
 GEMINI_MODELS = [
@@ -65,7 +66,7 @@ GEMINI_MODELS = [
 
 DEFAULT_PROVIDER = "OpenAI"
 DEFAULT_MODEL_OPENAI = "gpt-5-nano"
-DEFAULT_MODEL_CLAUDE = "claude-3-5-sonnet-latest"
+DEFAULT_MODEL_CLAUDE = "claude-4.1-opus"
 DEFAULT_MODEL_GEMINI = "gemini-2.5-flash"
 
 SYSTEM_PROMPT = (
