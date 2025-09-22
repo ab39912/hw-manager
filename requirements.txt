@@ -7,3 +7,6 @@ anthropic
 google-generativeai
 cohere
 tiktoken
+chromadb
+pypdf
+pysqlite3-binary
