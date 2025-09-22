@@ -46,25 +46,25 @@ except Exception:
 # ======================
 # Provider + model choices
 OPENAI_MODELS = [
-    ("gpt-5-nano",  "OpenAI • gpt-5-nano"),   # included by request (may not be enabled on all accounts)
-    ("chat-latest", "OpenAI • chat-latest"),
-    ("gpt-4o",      "OpenAI • gpt-4o"),
+    ("gpt-5-nano",  "gpt-5-nano"),   # included by request (may not be enabled on all accounts)
+    ("chat-latest", "gpt5-chat-latest"),
+    ("gpt-4o",      "gpt-4o"),
 ]
 
 CLAUDE_MODELS = [
-    ("claude-3-5-sonnet-latest", "Claude • 3.5 Sonnet (latest)"),
-    ("claude-3-opus-latest",     "Claude • 3 Opus (latest)"),
+    ("claude-3-5-sonnet-latest", "Claude-3.5 Sonnet"),
+    ("claude-3-opus-latest",     "Claude-3 Opus"),
 ]
 
 GEMINI_MODELS = [
-    ("gemini-1.5-pro-latest",   "Gemini • 1.5 Pro (latest)"),
-    ("gemini-1.5-flash-latest", "Gemini • 1.5 Flash (latest)"),
+    ("gemini-1.5-pro-latest",   "Gemini-2.5 Pro (latest)"),
+    ("gemini-1.5-flash-latest", "Gemini-2.5 Flash (latest)"),
 ]
 
 DEFAULT_PROVIDER = "OpenAI"
-DEFAULT_MODEL_OPENAI = "chat-latest"
+DEFAULT_MODEL_OPENAI = "gpt-5-nano"
 DEFAULT_MODEL_CLAUDE = "claude-3-5-sonnet-latest"
-DEFAULT_MODEL_GEMINI = "gemini-1.5-pro-latest"
+DEFAULT_MODEL_GEMINI = "gemini-2.5-flash"
 
 SYSTEM_PROMPT = (
     "You are a helpful Course Information Assistant.\n"
@@ -440,7 +440,7 @@ def build_unified_prompt(user_query: str, context_block: str) -> str:
 # Main UI (RAG + memory chat w/ provider switch)
 # ======================
 def run():
-    st.title("🧠 HW4: HTML RAG Chatbot with Memory — OpenAI • Claude • Gemini")
+    st.title("🧠 HW4: HTML RAG Chatbot with Memory")
     st.caption("Builds a persistent ChromaDB from HTML (two chunks per doc), keeps a 5-pair memory buffer, and lets you choose the LLM provider & model.")
 
     # --- API keys (any providers you plan to use) ---
