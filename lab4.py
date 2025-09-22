@@ -12,7 +12,6 @@ if not hasattr(st, "Page") or not hasattr(st, "navigation"):
             self.url_path = url_path
         def run(self):
             self._func()
-
     class _Navigation:
         def __init__(self, groups_dict):
             self._labels, self._pages = [], []
@@ -23,10 +22,8 @@ if not hasattr(st, "Page") or not hasattr(st, "navigation"):
         def run(self):
             choice = st.sidebar.radio("Pages", self._labels, index=0)
             self._pages[self._labels.index(choice)].run()
-
     def _nav(groups_dict):
         return _Navigation(groups_dict)
-
     if not hasattr(st, "Page"):
         st.Page = _Page       # type: ignore
     if not hasattr(st, "navigation"):
@@ -57,15 +54,15 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 EMBED_MODEL = "text-embedding-3-small"      # 1536-dim; cost-effective
 TOP_K = 4                                   # retrieved chunks per query
 MEMORY_TURNS = 5                            # keep last 5 Q&A turns
+PROVIDERS = ["OpenAI", "Anthropic", "Google"]
 
-# ── Model menus exactly as requested
+# ── Model menus shown to the user (labels)
 OPENAI_MODELS = [
     "gpt-5-nano",
     "gpt-5-chat-latest",
     "gpt-4o",
     "gpt-4o-mini",
 ]
-
 ANTHROPIC_MODELS = [
     "Opus 4-1-2025-08-25",
     "Opus 4-2025-05-14",
@@ -74,12 +71,18 @@ ANTHROPIC_MODELS = [
     "3-5-haiku",
     "3-haiku-2024-03-07",
 ]
-
 GOOGLE_MODELS = [
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flast-lite",  # used exactly as you provided; change to "flash-lite" if needed
+    "Gemini-2.5-pro",
+    "Gemini-2.5-flash",
+    "Gemini-2.5-flash-lite",  # label kept as requested; mapped to 'gemini-2.5-flash-lite'
 ]
+
+# ── Google label → API id mapping
+GOOGLE_MODEL_ID = {
+    "Gemini-2.5-pro":        "gemini-2.5-pro",
+    "Gemini-2.5-flash":      "gemini-2.5-flash",
+    "Gemini-2.5-flash-lite": "gemini-2.5-flash-lite",
+}
 
 SYSTEM_PROMPT = (
     "You are a helpful iSchool assistant. Answer ONLY using the retrieved context from the HTML corpus "
@@ -91,11 +94,7 @@ SYSTEM_PROMPT = (
 # Secrets/env helper (accepts alternate names and falls back to env vars)
 # ─────────────────────────────────────────────────────────────────────────────
 def get_secret(*names: str) -> str:
-    """
-    Return the first non-empty secret/env value among the provided names.
-    Trims whitespace. Falls back to os.environ.
-    """
-    # Streamlit secrets (if available)
+    """Return the first non-empty secret/env value among the provided names."""
     try:
         secrets = getattr(st, "secrets", {})
         for n in names:
@@ -104,7 +103,6 @@ def get_secret(*names: str) -> str:
                 return v.strip()
     except Exception:
         pass
-    # Environment
     for n in names:
         v = os.environ.get(n)
         if isinstance(v, str) and v.strip():
@@ -132,12 +130,17 @@ def ensure_anthropic():
         _anthropic_client = anthropic.Anthropic(api_key=get_secret("ANTHROPIC_API_KEY", "ANTHROPIC_KEY"))
     return _anthropic_client
 
-def ensure_gemini(model_name: str):
-    if model_name not in _gemini_model_cache:
+def _google_api_id(label: str) -> str:
+    return GOOGLE_MODEL_ID.get(label, label.lower())
+
+def ensure_gemini(model_label: str):
+    api_id = _google_api_id(model_label)
+    if api_id not in _gemini_model_cache:
         import google.generativeai as genai
-        genai.configure(api_key=get_secret("GEMINI_API_KEY"))
-        _gemini_model_cache[model_name] = genai.GenerativeModel(model_name)
-    return _gemini_model_cache[model_name]
+        # ✅ accept GEMINI_API_KEY in addition to GOOGLE_* names
+        genai.configure(api_key=get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APIKEY", "GOOGLE_KEY"))
+        _gemini_model_cache[api_id] = genai.GenerativeModel(api_id)
+    return _gemini_model_cache[api_id]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HTML → text → exactly two chunks (assignment requirement)
@@ -153,13 +156,7 @@ def html_to_text(html: str) -> str:
 
 def two_chunk_split(text: str) -> List[str]:
     """
-    EXACTLY TWO chunks per document.
-
-    Method: balanced sentence-halving.
-    - Split into rough sentences by '.', '!', '?', and line breaks.
-    - Concatenate sentences into two halves with ~equal character count (preserve order).
-
-    Why: keeps cohesion without over-fragmentation; simple and deterministic for org pages.
+    EXACTLY TWO chunks per document using balanced sentence-halving.
     """
     text = text.strip()
     if not text:
@@ -178,7 +175,6 @@ def two_chunk_split(text: str) -> List[str]:
             rough.append(tail)
     if not rough:
         rough = [text]
-
     total = sum(len(s) for s in rough)
     target = total // 2
     left, right, acc = [], [], 0
@@ -213,7 +209,6 @@ def build_db_once(html_dir: Path, db_path: Path):
     files = sorted([p for p in html_dir.glob("**/*.html") if p.is_file()])
     if not files:
         raise FileNotFoundError(f"No HTML files found in: {html_dir.resolve()}")
-
     chunks, metas = [], []
     for p in files:
         raw = p.read_text(encoding="utf-8", errors="ignore")
@@ -222,7 +217,6 @@ def build_db_once(html_dir: Path, db_path: Path):
         for idx, c in enumerate([c1, c2], start=1):
             chunks.append(c)
             metas.append({"source": str(p), "part": idx})
-
     embs = embed_texts(chunks)
     payload = {"embeddings": embs, "chunks": chunks, "metas": metas}
     with open(db_path, "wb") as f:
@@ -230,9 +224,7 @@ def build_db_once(html_dir: Path, db_path: Path):
 
 def retrieve(query: str, k: int = TOP_K) -> List[Dict[str, Any]]:
     if not DB_PATH.exists():
-        raise RuntimeError(
-            "Vector DB not found and could not be created. Ensure HTML files exist in 'hw4_htmls/'."
-        )
+        raise RuntimeError("Vector DB not found and could not be created. Ensure HTML files exist in 'hw4_htmls/'.")
     with open(DB_PATH, "rb") as f:
         db = pickle.load(f)
     q = embed_texts([query])
@@ -268,19 +260,12 @@ def call_openai(model: str, sys_prompt: str, history: List[Dict[str, str]]) -> s
 
 def call_anthropic(model: str, sys_prompt: str, history: List[Dict[str, str]]) -> str:
     client = ensure_anthropic()
-    msgs = []
-    for m in history:
-        msgs.append({
-            "role": "user" if m["role"] == "user" else "assistant",
-            "content": m["content"]
-        })
-    resp = client.messages.create(
-        model=model, system=sys_prompt, temperature=0.2, max_tokens=1200, messages=msgs
-    )
+    msgs = [{"role": ("user" if m["role"] == "user" else "assistant"), "content": m["content"]} for m in history]
+    resp = client.messages.create(model=model, system=sys_prompt, temperature=0.2, max_tokens=1200, messages=msgs)
     return "".join([b.text for b in resp.content if hasattr(b, "text")])
 
-def call_gemini(model: str, sys_prompt: str, history: List[Dict[str, str]]) -> str:
-    mdl = ensure_gemini(model)
+def call_gemini(model_label: str, sys_prompt: str, history: List[Dict[str, str]]) -> str:
+    mdl = ensure_gemini(model_label)  # resolves label → API id (lowercase)
     lines = [f"System:\n{sys_prompt}\n"]
     for m in history:
         role = "User" if m["role"] == "user" else "Assistant"
@@ -291,13 +276,6 @@ def call_gemini(model: str, sys_prompt: str, history: List[Dict[str, str]]) -> s
 # ─────────────────────────────────────────────────────────────────────────────
 # Session / UI
 # ─────────────────────────────────────────────────────────────────────────────
-def _init_state():
-    if "chat" not in st.session_state:
-        st.session_state.chat = deque(maxlen=MEMORY_TURNS)  # (user, assistant, model_tag)
-    if "provider" not in st.session_state:
-        st.session_state.provider = "OpenAI"
-_init_state()
-
 def _auto_build_db_once():
     """Build vector DB if missing; surface errors inline."""
     if DB_PATH.exists():
@@ -310,7 +288,13 @@ def _auto_build_db_once():
         st.error(f"Failed to initialize vector DB: {e}")
 
 def run():
-    # One-time auto-build if needed (no UI button)
+    # ✅ Make sure session defaults exist before any sidebar widgets read them
+    if "chat" not in st.session_state:
+        st.session_state.chat = deque(maxlen=MEMORY_TURNS)  # (user, assistant, model_tag)
+    if "provider" not in st.session_state:
+        st.session_state.provider = "OpenAI"
+
+    # One-time auto-build if needed
     _auto_build_db_once()
 
     st.title("🎓 HW4: iSchool Student Orgs RAG Chatbot")
@@ -318,47 +302,30 @@ def run():
 
     with st.sidebar:
         st.header("🤖 Provider & Model")
-        provider = st.selectbox(
-            "Provider", ["OpenAI", "Anthropic", "Google"],
-            index=["OpenAI","Anthropic","Google"].index(st.session_state.provider)
-        )
+        prov_default = st.session_state.get("provider", "OpenAI")
+        provider = st.selectbox("Provider", PROVIDERS,
+                                index=(PROVIDERS.index(prov_default) if prov_default in PROVIDERS else 0))
         st.session_state.provider = provider
 
         if provider == "OpenAI":
             model = st.selectbox("Model", OPENAI_MODELS, index=0)
             if not get_secret("OPENAI_API_KEY", "OPENAI_KEY"):
-                with st.expander("Add OpenAI key (click for tips)"):
-                    st.markdown("Looking for `OPENAI_API_KEY` (or `OPENAI_KEY`).")
-                    try:
-                        st.code("\n".join(sorted([k for k in getattr(st, 'secrets', {}).keys()])), language="text")
-                    except Exception:
-                        st.write("No `st.secrets` available.")
+                st.warning("Missing OPENAI_API_KEY (or OPENAI_KEY).")
         elif provider == "Anthropic":
             model = st.selectbox("Model", ANTHROPIC_MODELS, index=0)
             if not get_secret("ANTHROPIC_API_KEY", "ANTHROPIC_KEY"):
-                with st.expander("Add Anthropic key (click for tips)"):
-                    st.markdown("Looking for `ANTHROPIC_API_KEY` (or `ANTHROPIC_KEY`).")
-                    try:
-                        st.code("\n".join(sorted([k for k in getattr(st, 'secrets', {}).keys()])), language="text")
-                    except Exception:
-                        st.write("No `st.secrets` available.")
+                st.warning("Missing ANTHROPIC_API_KEY (or ANTHROPIC_KEY).")
         else:
-            model = st.selectbox("Model", GOOGLE_MODELS, index=0)
-            if not get_secret("GOOGLE_API_KEY", "GOOGLE_APIKEY", "GOOGLE_KEY"):
-                with st.expander("Add Google key (click for tips)"):
-                    st.markdown("Looking for `GOOGLE_API_KEY` (or `GOOGLE_APIKEY`, `GOOGLE_KEY`).")
-                    try:
-                        st.code("\n".join(sorted([k for k in getattr(st, 'secrets', {}).keys()])), language="text")
-                    except Exception:
-                        st.write("No `st.secrets` available.")
+            model = st.selectbox("Model", GOOGLE_MODELS, index=0)  # label
+            if not get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APIKEY", "GOOGLE_KEY"):
+                st.warning("Missing GEMINI_API_KEY (or GOOGLE_API_KEY).")
+            api_id = GOOGLE_MODEL_ID.get(model, model.lower())
+            st.caption(f"API id → `{api_id}`")
 
         st.divider()
         top_k = st.slider("Retrieved chunks (k)", 2, 6, TOP_K, 1)
         st.caption("The assistant will only use retrieved context from your HTML corpus.")
-        if DB_PATH.exists():
-            st.caption(f"Vector DB: `{DB_PATH}`")
-        else:
-            st.caption("Vector DB not ready yet.")
+        st.caption(f"Vector DB: `{DB_PATH}`" if DB_PATH.exists() else "Vector DB not ready yet.")
 
     # Render last turns
     for u, a, tag in list(st.session_state.chat):
@@ -391,7 +358,7 @@ def run():
             elif st.session_state.provider == "Anthropic":
                 ans = call_anthropic(model, SYSTEM_PROMPT, history)
             else:
-                ans = call_gemini(model, SYSTEM_PROMPT, history)
+                ans = call_gemini(model, SYSTEM_PROMPT, history)  # label; mapping happens inside
         except Exception as e:
             ans = f"⚠️ Model error: {e}"
 
@@ -413,4 +380,3 @@ def run():
 # Allow running standalone
 if __name__ == "__main__":
     run()
-
