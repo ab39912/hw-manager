@@ -57,9 +57,11 @@ CLAUDE_MODELS = [
 ]
 
 GEMINI_MODELS = [
-    ("gemini-1.5-pro-latest",   "Gemini-2.5 Pro (latest)"),
-    ("gemini-1.5-flash-latest", "Gemini-2.5 Flash (latest)"),
+    ("gemini-2.5-pro",       "Gemini-2.5 Pro"),
+    ("gemini-2.5-flash",     "Gemini-2.5 Flash"),
+    ("gemini-2.5-flash-lite","Gemini-2.5 Flash Lite"),
 ]
+
 
 DEFAULT_PROVIDER = "OpenAI"
 DEFAULT_MODEL_OPENAI = "gpt-5-nano"
