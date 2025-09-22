@@ -78,7 +78,7 @@ ANTHROPIC_MODELS = [
 GOOGLE_MODELS = [
     "Gemini-2.5-pro",
     "Gemini-2.5-flash",
-    "Gemini-2.5-flast-lite",  # spelled as you provided; change to "flash-lite" if needed
+    "Gemini-2.5-flast-lite",  # used exactly as you provided; change to "flash-lite" if needed
 ]
 
 SYSTEM_PROMPT = (
@@ -86,6 +86,30 @@ SYSTEM_PROMPT = (
     "about student organizations. If the answer is not in the context, say you don't know. "
     "Prefer specific club names, meeting times, locations, eligibility rules, and links if present."
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Secrets/env helper (accepts alternate names and falls back to env vars)
+# ─────────────────────────────────────────────────────────────────────────────
+def get_secret(*names: str) -> str:
+    """
+    Return the first non-empty secret/env value among the provided names.
+    Trims whitespace. Falls back to os.environ.
+    """
+    # Streamlit secrets (if available)
+    try:
+        secrets = getattr(st, "secrets", {})
+        for n in names:
+            v = secrets.get(n)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    except Exception:
+        pass
+    # Environment
+    for n in names:
+        v = os.environ.get(n)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Lazy clients for providers
@@ -98,20 +122,20 @@ def ensure_openai():
     global _openai_client
     if _openai_client is None:
         from openai import OpenAI
-        _openai_client = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY", ""))
+        _openai_client = OpenAI(api_key=get_secret("OPENAI_API_KEY", "OPENAI_KEY"))
     return _openai_client
 
 def ensure_anthropic():
     global _anthropic_client
     if _anthropic_client is None:
         import anthropic
-        _anthropic_client = anthropic.Anthropic(api_key=st.secrets.get("ANTHROPIC_API_KEY", ""))
+        _anthropic_client = anthropic.Anthropic(api_key=get_secret("ANTHROPIC_API_KEY", "ANTHROPIC_KEY"))
     return _anthropic_client
 
 def ensure_gemini(model_name: str):
     if model_name not in _gemini_model_cache:
         import google.generativeai as genai
-        genai.configure(api_key=st.secrets.get("GOOGLE_API_KEY", ""))
+        genai.configure(api_key=get_secret("GOOGLE_API_KEY", "GOOGLE_APIKEY", "GOOGLE_KEY"))
         _gemini_model_cache[model_name] = genai.GenerativeModel(model_name)
     return _gemini_model_cache[model_name]
 
@@ -134,6 +158,8 @@ def two_chunk_split(text: str) -> List[str]:
     Method: balanced sentence-halving.
     - Split into rough sentences by '.', '!', '?', and line breaks.
     - Concatenate sentences into two halves with ~equal character count (preserve order).
+
+    Why: keeps cohesion without over-fragmentation; simple and deterministic for org pages.
     """
     text = text.strip()
     if not text:
@@ -244,8 +270,10 @@ def call_anthropic(model: str, sys_prompt: str, history: List[Dict[str, str]]) -
     client = ensure_anthropic()
     msgs = []
     for m in history:
-        role = m["role"]
-        msgs.append({"role":"user" if role == "user" else "assistant", "content": m["content"]})
+        msgs.append({
+            "role": "user" if m["role"] == "user" else "assistant",
+            "content": m["content"]
+        })
     resp = client.messages.create(
         model=model, system=sys_prompt, temperature=0.2, max_tokens=1200, messages=msgs
     )
@@ -290,27 +318,43 @@ def run():
 
     with st.sidebar:
         st.header("🤖 Provider & Model")
-        provider = st.selectbox("Provider", ["OpenAI", "Anthropic", "Google"],
-                                index=["OpenAI","Anthropic","Google"].index(st.session_state.provider))
+        provider = st.selectbox(
+            "Provider", ["OpenAI", "Anthropic", "Google"],
+            index=["OpenAI","Anthropic","Google"].index(st.session_state.provider)
+        )
         st.session_state.provider = provider
 
         if provider == "OpenAI":
             model = st.selectbox("Model", OPENAI_MODELS, index=0)
-            if not st.secrets.get("OPENAI_API_KEY"):
-                st.warning("Add OPENAI_API_KEY to secrets.")
+            if not get_secret("OPENAI_API_KEY", "OPENAI_KEY"):
+                with st.expander("Add OpenAI key (click for tips)"):
+                    st.markdown("Looking for `OPENAI_API_KEY` (or `OPENAI_KEY`).")
+                    try:
+                        st.code("\n".join(sorted([k for k in getattr(st, 'secrets', {}).keys()])), language="text")
+                    except Exception:
+                        st.write("No `st.secrets` available.")
         elif provider == "Anthropic":
             model = st.selectbox("Model", ANTHROPIC_MODELS, index=0)
-            if not st.secrets.get("ANTHROPIC_API_KEY"):
-                st.warning("Add ANTHROPIC_API_KEY to secrets.")
+            if not get_secret("ANTHROPIC_API_KEY", "ANTHROPIC_KEY"):
+                with st.expander("Add Anthropic key (click for tips)"):
+                    st.markdown("Looking for `ANTHROPIC_API_KEY` (or `ANTHROPIC_KEY`).")
+                    try:
+                        st.code("\n".join(sorted([k for k in getattr(st, 'secrets', {}).keys()])), language="text")
+                    except Exception:
+                        st.write("No `st.secrets` available.")
         else:
             model = st.selectbox("Model", GOOGLE_MODELS, index=0)
-            if not st.secrets.get("GOOGLE_API_KEY"):
-                st.warning("Add GOOGLE_API_KEY to secrets.")
+            if not get_secret("GOOGLE_API_KEY", "GOOGLE_APIKEY", "GOOGLE_KEY"):
+                with st.expander("Add Google key (click for tips)"):
+                    st.markdown("Looking for `GOOGLE_API_KEY` (or `GOOGLE_APIKEY`, `GOOGLE_KEY`).")
+                    try:
+                        st.code("\n".join(sorted([k for k in getattr(st, 'secrets', {}).keys()])), language="text")
+                    except Exception:
+                        st.write("No `st.secrets` available.")
 
         st.divider()
         top_k = st.slider("Retrieved chunks (k)", 2, 6, TOP_K, 1)
         st.caption("The assistant will only use retrieved context from your HTML corpus.")
-
         if DB_PATH.exists():
             st.caption(f"Vector DB: `{DB_PATH}`")
         else:
@@ -369,3 +413,4 @@ def run():
 # Allow running standalone
 if __name__ == "__main__":
     run()
+
