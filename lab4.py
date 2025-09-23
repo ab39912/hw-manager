@@ -302,7 +302,7 @@ def run():
 
     ensure_vecdb()
 
-    st.title("🎓 HW4: iSchool Student Orgs RAG Chatbot")
+    st.title("🎓 HW4: Student Orgs RAG Chatbot")
     st.caption("Answers are grounded strictly in your `hw4_htmls/` corpus (exactly two chunks per HTML). No files are written.")
 
     with st.sidebar:
