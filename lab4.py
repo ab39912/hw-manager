@@ -326,14 +326,8 @@ def run():
             st.caption(f"API id → `{_google_api_id(model)}`")
 
         st.divider()
-        top_k = st.slider("Retrieved chunks (k)", 2, 8, TOP_K, 1)
-        st.caption("The assistant will only use retrieved context from your HTML corpus.")
-        if st.button("↻ Rebuild in-memory index"):
-            try:
-                st.session_state.hw4_vecdb = build_vecdb_in_memory(HTML_DIR)
-                st.success("Index rebuilt in memory.")
-            except Exception as e:
-                st.error(f"Rebuild failed: {e}")
+        top_k = TOP_K
+        st.caption("The assistant answers using your HTML corpus.")
 
     # Render past turns
     for u, a, tag in list(st.session_state.chat):
