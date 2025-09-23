@@ -45,7 +45,7 @@ from bs4 import BeautifulSoup
 st.set_page_config(page_title="HW4 • iSchool Orgs RAG", page_icon="🎓", layout="wide")
 
 # ── Paths / corpus
-HTML_DIR = Path("hw4_htmls")
+HTML_DIR = Path("hw4_htmls")                # your folder with the HTML files
 
 # ── Embedding config
 EMBED_MODEL = "text-embedding-3-small"
@@ -244,7 +244,7 @@ def format_context(hits: List[Dict[str, Any]]) -> str:
     return "\n\n---\n\n".join(parts)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Provider calls (bigger output budgets; no forced temperature)
+# Provider calls (no temperature overrides so all models work)
 # ─────────────────────────────────────────────────────────────────────────────
 def call_openai(model: str, sys_prompt: str, history: List[Dict[str, str]]) -> str:
     client = ensure_openai()
@@ -252,14 +252,12 @@ def call_openai(model: str, sys_prompt: str, history: List[Dict[str, str]]) -> s
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role":"system","content":sys_prompt}] + history,
-            max_tokens=4096,  # bigger headroom
         )
     except Exception:
-        # Fallback with explicit default temp=1 if required by the account
+        # Fallback with explicit default temp=1 if the account requires it
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role":"system","content":sys_prompt}] + history,
-            max_tokens=4096,
             temperature=1,
         )
     return resp.choices[0].message.content
@@ -268,9 +266,9 @@ def call_anthropic(model: str, sys_prompt: str, history: List[Dict[str, str]]) -
     client = ensure_anthropic()
     msgs = [{"role": ("user" if m["role"] == "user" else "assistant"), "content": m["content"]} for m in history]
     try:
-        resp = client.messages.create(model=model, system=sys_prompt, max_tokens=4000, messages=msgs)
+        resp = client.messages.create(model=model, system=sys_prompt, max_tokens=1200, messages=msgs)
     except Exception:
-        resp = client.messages.create(model=model, system=sys_prompt, max_tokens=4000, temperature=1, messages=msgs)
+        resp = client.messages.create(model=model, system=sys_prompt, temperature=1, max_tokens=1200, messages=msgs)
     return "".join([b.text for b in resp.content if hasattr(b, "text")])
 
 def call_gemini(model_label: str, sys_prompt: str, history: List[Dict[str, str]]) -> str:
@@ -279,11 +277,7 @@ def call_gemini(model_label: str, sys_prompt: str, history: List[Dict[str, str]]
     for m in history:
         role = "User" if m["role"] == "user" else "Assistant"
         lines.append(f"{role}:\n{m['content']}\n")
-    # Some variants reject temperature overrides; try larger max tokens only
-    try:
-        resp = mdl.generate_content("\n".join(lines), generation_config={"max_output_tokens": 4096})
-    except Exception:
-        resp = mdl.generate_content("\n".join(lines))  # fallback to model defaults
+    resp = mdl.generate_content("\n".join(lines))  # use model default settings (no temperature override)
     return (getattr(resp, "text", None) or "").strip()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -326,7 +320,6 @@ def run():
 
         st.divider()
         top_k = st.slider("Retrieved chunks (k)", 2, 8, TOP_K, 1)
-        show_full_snippets = st.toggle("Show full retrieved snippets", value=False, help="Expanders will always show full text.")
         st.caption("The assistant will only use retrieved context from your HTML corpus.")
         if st.button("↻ Rebuild in-memory index"):
             try:
@@ -365,7 +358,6 @@ def run():
     history.append({"role":"user", "content": user_q})
 
     with st.chat_message("assistant"):
-        # Get the model answer first (no truncation)
         try:
             if st.session_state.provider == "OpenAI":
                 ans = call_openai(model, SYSTEM_PROMPT, history)
@@ -376,24 +368,19 @@ def run():
         except Exception as e:
             ans = f"⚠️ Model error: {e}"
 
-        st.markdown(f"_{st.session_state.provider} · {model}_")
-        st.write(ans)  # write avoids any weird markdown truncation
-
-        # Retrieved snippets (compact list, optional truncation)
+        # Show quick source previews
         if hits:
-            st.markdown("### Retrieved snippets")
+            previews = []
             for i, h in enumerate(hits, start=1):
                 src = Path(h["meta"]["source"]).name
                 part = h["meta"]["part"]
-                # compact preview
-                preview = (h["chunk"] or "").strip().replace("\n", " ")
-                if not show_full_snippets and len(preview) > 340:
-                    preview = preview[:340].rstrip() + "…"
-                st.markdown(f"**Doc {i}: {src} (part {part})** — {preview}")
+                snippet = (h["chunk"] or "").strip().replace("\n", " ")
+                if len(snippet) > 340:
+                    snippet = snippet[:340].rstrip() + "…"
+                previews.append(f"**Doc {i}: {src} (part {part})** — {snippet}")
+            st.markdown("\n\n**Retrieved snippets:**\n\n" + "\n\n".join(previews))
 
-                # full text always available in an expander
-                with st.expander(f"Show full text · Doc {i}: {src} (part {part})"):
-                    st.text(h["chunk"])
+        st.markdown(f"_{st.session_state.provider} · {model}_\n\n{ans}")
 
     # Save to short-term memory
     st.session_state.chat.append((user_q, ans, f"{st.session_state.provider} · {model}"))
