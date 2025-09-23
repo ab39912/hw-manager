@@ -30,11 +30,11 @@ if not hasattr(st, "Page") or not hasattr(st, "navigation"):
         st.navigation = _nav  # type: ignore
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HW4: iSchool Student Orgs RAG Chatbot (HTML corpus, vector DB built once)
+# HW4: iSchool Student Orgs RAG Chatbot (HTML corpus, in-memory vector DB)
+# No files are created; index lives only in memory for this app session.
 # Providers: OpenAI, Anthropic (Claude), Google (Gemini)
 # ─────────────────────────────────────────────────────────────────────────────
 import os
-import pickle
 from collections import deque
 from pathlib import Path
 from typing import List, Dict, Any
@@ -45,9 +45,7 @@ from bs4 import BeautifulSoup
 st.set_page_config(page_title="HW4 • iSchool Orgs RAG", page_icon="🎓", layout="wide")
 
 # ── Paths / corpus
-HTML_DIR = Path("hw4_htmls")                # your folder with the HTML files
-DB_PATH  = Path("data/ischool_vecdb.pkl")   # persisted vector db file
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+HTML_DIR = Path("hw4_htmls")
 
 # ── Embedding config
 EMBED_MODEL = "text-embedding-3-small"
@@ -73,13 +71,13 @@ ANTHROPIC_MODELS = [
 GOOGLE_MODELS = [
     "Gemini-2.5-pro",
     "Gemini-2.5-flash",
-    "Gemini-2.5-flast-lite",  # label kept as requested; mapped to 'gemini-2.5-flash-lite'
+    "Gemini-2.5-flash-lite",  # label kept as requested; mapped to 'gemini-2.5-flash-lite'
 ]
 # label → API id mapping (lowercase; corrects 'flast' → 'flash')
 GOOGLE_MODEL_ID = {
     "Gemini-2.5-pro":        "gemini-2.5-pro",
     "Gemini-2.5-flash":      "gemini-2.5-flash",
-    "Gemini-2.5-flast-lite": "gemini-2.5-flash-lite",
+    "Gemini-2.5-flash-lite": "gemini-2.5-flash-lite",
 }
 
 SYSTEM_PROMPT = (
@@ -185,7 +183,7 @@ def two_chunk_split(text: str) -> List[str]:
     return [" ".join(left).strip(), " ".join(right).strip()]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Embeddings + lightweight persisted vector DB
+# In-memory vector DB (no disk writes)
 # ─────────────────────────────────────────────────────────────────────────────
 def embed_texts(texts: List[str]) -> np.ndarray:
     if not texts:
@@ -201,10 +199,7 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     b /= (np.linalg.norm(b, axis=1, keepdims=True) + 1e-8)
     return a @ b.T
 
-def build_db_once(html_dir: Path, db_path: Path):
-    """Create the vector DB only if it doesn't exist."""
-    if db_path.exists():
-        return
+def build_vecdb_in_memory(html_dir: Path) -> Dict[str, Any]:
     files = sorted([p for p in html_dir.glob("**/*.html") if p.is_file()])
     if not files:
         raise FileNotFoundError(f"No HTML files found in: {html_dir.resolve()}")
@@ -217,15 +212,18 @@ def build_db_once(html_dir: Path, db_path: Path):
             chunks.append(c)
             metas.append({"source": str(p), "part": idx})
     embs = embed_texts(chunks)
-    payload = {"embeddings": embs, "chunks": chunks, "metas": metas}
-    with open(db_path, "wb") as f:
-        pickle.dump(payload, f)
+    return {"embeddings": embs, "chunks": chunks, "metas": metas}
+
+def ensure_vecdb():
+    """Create the in-memory index once per session (no disk persistence)."""
+    if "hw4_vecdb" not in st.session_state:
+        with st.spinner("Indexing HTML corpus (one-time per session)…"):
+            st.session_state.hw4_vecdb = build_vecdb_in_memory(HTML_DIR)
 
 def retrieve(query: str, k: int = TOP_K) -> List[Dict[str, Any]]:
-    if not DB_PATH.exists():
-        raise RuntimeError("Vector DB not found and could not be created. Ensure HTML files exist in 'hw4_htmls/'.")
-    with open(DB_PATH, "rb") as f:
-        db = pickle.load(f)
+    if "hw4_vecdb" not in st.session_state:
+        raise RuntimeError("Vector DB not ready.")
+    db = st.session_state.hw4_vecdb
     q = embed_texts([query])
     sims = cosine_sim(q, db["embeddings"])[0]
     idxs = np.argsort(-sims)[:k]
@@ -246,81 +244,63 @@ def format_context(hits: List[Dict[str, Any]]) -> str:
     return "\n\n---\n\n".join(parts)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Provider calls (no hidden fallbacks)
+# Provider calls (bigger output budgets; no forced temperature)
 # ─────────────────────────────────────────────────────────────────────────────
 def call_openai(model: str, sys_prompt: str, history: List[Dict[str, str]]) -> str:
-    """
-    Some OpenAI models (e.g., gpt-5-nano) reject non-default temperature.
-    We therefore DO NOT pass temperature. If your account requires it elsewhere,
-    add a try/except with a re-issue including temperature.
-    """
     client = ensure_openai()
     try:
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role":"system","content":sys_prompt}] + history,
-            # no temperature override
+            max_tokens=4096,  # bigger headroom
         )
     except Exception:
-        # Fallback (rare): attempt with explicit default temperature=1
+        # Fallback with explicit default temp=1 if required by the account
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role":"system","content":sys_prompt}] + history,
+            max_tokens=4096,
             temperature=1,
         )
     return resp.choices[0].message.content
 
 def call_anthropic(model: str, sys_prompt: str, history: List[Dict[str, str]]) -> str:
-    """
-    Most Anthropic models accept temperature, but to be safe we try without it first
-    and only include temperature if needed.
-    """
     client = ensure_anthropic()
     msgs = [{"role": ("user" if m["role"] == "user" else "assistant"), "content": m["content"]} for m in history]
     try:
-        resp = client.messages.create(model=model, system=sys_prompt, max_tokens=1200, messages=msgs)
+        resp = client.messages.create(model=model, system=sys_prompt, max_tokens=4000, messages=msgs)
     except Exception:
-        resp = client.messages.create(model=model, system=sys_prompt, temperature=1, max_tokens=1200, messages=msgs)
+        resp = client.messages.create(model=model, system=sys_prompt, max_tokens=4000, temperature=1, messages=msgs)
     return "".join([b.text for b in resp.content if hasattr(b, "text")])
 
 def call_gemini(model_label: str, sys_prompt: str, history: List[Dict[str, str]]) -> str:
-    """
-    Some Gemini variants reject non-default temperature → we do NOT pass generation_config.
-    """
     mdl = ensure_gemini(model_label)  # resolves label → API id (lowercase)
     lines = [f"System:\n{sys_prompt}\n"]
     for m in history:
         role = "User" if m["role"] == "user" else "Assistant"
         lines.append(f"{role}:\n{m['content']}\n")
-    resp = mdl.generate_content("\n".join(lines))  # use model default settings
+    # Some variants reject temperature overrides; try larger max tokens only
+    try:
+        resp = mdl.generate_content("\n".join(lines), generation_config={"max_output_tokens": 4096})
+    except Exception:
+        resp = mdl.generate_content("\n".join(lines))  # fallback to model defaults
     return (getattr(resp, "text", None) or "").strip()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Session / UI
 # ─────────────────────────────────────────────────────────────────────────────
-def _auto_build_db_once():
-    """Build vector DB if missing; surface errors inline."""
-    if DB_PATH.exists():
-        return
-    try:
-        with st.spinner("Initializing vector database from HTMLs (one-time)…"):
-            build_db_once(HTML_DIR, DB_PATH)
-        st.toast(f"Vector DB created: {DB_PATH}", icon="✅")
-    except Exception as e:
-        st.error(f"Failed to initialize vector DB: {e}")
-
 def run():
-    # Ensure session defaults exist before any sidebar widgets read them
+    # Ensure session defaults
     if "chat" not in st.session_state:
-        st.session_state.chat = deque(maxlen=MEMORY_TURNS)  # (user, assistant, model_tag)
+        st.session_state.chat = deque(maxlen=MEMORY_TURNS)   # (user, assistant, model_tag)
     if "provider" not in st.session_state:
         st.session_state.provider = "OpenAI"
 
-    # One-time auto-build if needed
-    _auto_build_db_once()
+    # Build in-memory index once per session (no files created)
+    ensure_vecdb()
 
     st.title("🎓 HW4: iSchool Student Orgs RAG Chatbot")
-    st.caption("Answers are grounded strictly in your `hw4_htmls/` corpus (exactly two chunks per HTML).")
+    st.caption("Answers are grounded strictly in your `hw4_htmls/` corpus (exactly two chunks per HTML). No files are written.")
 
     with st.sidebar:
         st.header("🤖 Provider & Model")
@@ -346,10 +326,16 @@ def run():
 
         st.divider()
         top_k = st.slider("Retrieved chunks (k)", 2, 8, TOP_K, 1)
+        show_full_snippets = st.toggle("Show full retrieved snippets", value=False, help="Expanders will always show full text.")
         st.caption("The assistant will only use retrieved context from your HTML corpus.")
-        st.caption(f"Vector DB: `{DB_PATH}`" if DB_PATH.exists() else "Vector DB not ready yet.")
+        if st.button("↻ Rebuild in-memory index"):
+            try:
+                st.session_state.hw4_vecdb = build_vecdb_in_memory(HTML_DIR)
+                st.success("Index rebuilt in memory.")
+            except Exception as e:
+                st.error(f"Rebuild failed: {e}")
 
-    # Render last turns (previous messages)
+    # Render last turns
     for u, a, tag in list(st.session_state.chat):
         with st.chat_message("user"):
             st.markdown(u)
@@ -361,7 +347,7 @@ def run():
     if not user_q:
         return
 
-    # Show the user's message immediately
+    # Show user's message immediately
     with st.chat_message("user"):
         st.markdown(user_q)
 
@@ -379,6 +365,7 @@ def run():
     history.append({"role":"user", "content": user_q})
 
     with st.chat_message("assistant"):
+        # Get the model answer first (no truncation)
         try:
             if st.session_state.provider == "OpenAI":
                 ans = call_openai(model, SYSTEM_PROMPT, history)
@@ -389,19 +376,24 @@ def run():
         except Exception as e:
             ans = f"⚠️ Model error: {e}"
 
-        # Show quick source previews
+        st.markdown(f"_{st.session_state.provider} · {model}_")
+        st.write(ans)  # write avoids any weird markdown truncation
+
+        # Retrieved snippets (compact list, optional truncation)
         if hits:
-            previews = []
+            st.markdown("### Retrieved snippets")
             for i, h in enumerate(hits, start=1):
                 src = Path(h["meta"]["source"]).name
                 part = h["meta"]["part"]
-                snippet = (h["chunk"] or "").strip().replace("\n", " ")
-                if len(snippet) > 340:
-                    snippet = snippet[:340].rstrip() + "…"
-                previews.append(f"**Doc {i}: {src} (part {part})** — {snippet}")
-            st.markdown("\n\n**Retrieved snippets:**\n\n" + "\n\n".join(previews))
+                # compact preview
+                preview = (h["chunk"] or "").strip().replace("\n", " ")
+                if not show_full_snippets and len(preview) > 340:
+                    preview = preview[:340].rstrip() + "…"
+                st.markdown(f"**Doc {i}: {src} (part {part})** — {preview}")
 
-        st.markdown(f"_{st.session_state.provider} · {model}_\n\n{ans}")
+                # full text always available in an expander
+                with st.expander(f"Show full text · Doc {i}: {src} (part {part})"):
+                    st.text(h["chunk"])
 
     # Save to short-term memory
     st.session_state.chat.append((user_q, ans, f"{st.session_state.provider} · {model}"))
