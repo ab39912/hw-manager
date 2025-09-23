@@ -52,7 +52,7 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # ── Embedding config
 EMBED_MODEL = "text-embedding-3-small"      # 1536-dim; cost-effective
-TOP_K = 4                                   # retrieved chunks per query
+TOP_K = 5                                   # retrieved chunks per query (you can change in sidebar)
 MEMORY_TURNS = 5                            # keep last 5 Q&A turns
 PROVIDERS = ["OpenAI", "Anthropic", "Google"]
 
@@ -76,8 +76,7 @@ GOOGLE_MODELS = [
     "Gemini-2.5-flash",
     "Gemini-2.5-flash-lite",  # label kept as requested; mapped to 'gemini-2.5-flash-lite'
 ]
-
-# ── Google label → API id mapping
+# label → API id mapping (lowercase; corrects 'flast' → 'flash')
 GOOGLE_MODEL_ID = {
     "Gemini-2.5-pro":        "gemini-2.5-pro",
     "Gemini-2.5-flash":      "gemini-2.5-flash",
@@ -85,9 +84,10 @@ GOOGLE_MODEL_ID = {
 }
 
 SYSTEM_PROMPT = (
-    "You are a helpful iSchool assistant. Answer ONLY using the retrieved context from the HTML corpus "
-    "about student organizations. If the answer is not in the context, say you don't know. "
-    "Prefer specific club names, meeting times, locations, eligibility rules, and links if present."
+    "You are a helpful iSchool assistant. Use ONLY the retrieved HTML context about student organizations. "
+    "If the context fully lacks the answer, say you don't know. If it is partially relevant, answer with what IS "
+    "known and clearly state what is unknown. Prefer specific club names, meeting times, locations, eligibility "
+    "rules, and links if present."
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -137,7 +137,7 @@ def ensure_gemini(model_label: str):
     api_id = _google_api_id(model_label)
     if api_id not in _gemini_model_cache:
         import google.generativeai as genai
-        # ✅ accept GEMINI_API_KEY in addition to GOOGLE_* names
+        # accept GEMINI_API_KEY in addition to GOOGLE_* names
         genai.configure(api_key=get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APIKEY", "GOOGLE_KEY"))
         _gemini_model_cache[api_id] = genai.GenerativeModel(api_id)
     return _gemini_model_cache[api_id]
@@ -288,7 +288,7 @@ def _auto_build_db_once():
         st.error(f"Failed to initialize vector DB: {e}")
 
 def run():
-    # ✅ Make sure session defaults exist before any sidebar widgets read them
+    # Ensure session defaults exist before any sidebar widgets read them
     if "chat" not in st.session_state:
         st.session_state.chat = deque(maxlen=MEMORY_TURNS)  # (user, assistant, model_tag)
     if "provider" not in st.session_state:
@@ -323,20 +323,25 @@ def run():
             st.caption(f"API id → `{api_id}`")
 
         st.divider()
-        top_k = st.slider("Retrieved chunks (k)", 2, 6, TOP_K, 1)
+        top_k = st.slider("Retrieved chunks (k)", 2, 8, TOP_K, 1)
         st.caption("The assistant will only use retrieved context from your HTML corpus.")
         st.caption(f"Vector DB: `{DB_PATH}`" if DB_PATH.exists() else "Vector DB not ready yet.")
 
-    # Render last turns
+    # Render last turns (previous messages)
     for u, a, tag in list(st.session_state.chat):
         with st.chat_message("user"):
             st.markdown(u)
         with st.chat_message("assistant"):
             st.markdown(f"_{tag}_\n\n{a}")
 
+    # Current user input
     user_q = st.chat_input("Type your question…")
     if not user_q:
         return
+
+    # 👇 Show the user's message immediately so it doesn't feel like it "disappears"
+    with st.chat_message("user"):
+        st.markdown(user_q)
 
     # Retrieve & answer
     try:
@@ -362,6 +367,7 @@ def run():
         except Exception as e:
             ans = f"⚠️ Model error: {e}"
 
+        # Show quick source previews
         if hits:
             previews = []
             for i, h in enumerate(hits, start=1):
@@ -375,6 +381,7 @@ def run():
 
         st.markdown(f"_{st.session_state.provider} · {model}_\n\n{ans}")
 
+    # Save to short-term memory
     st.session_state.chat.append((user_q, ans, f"{st.session_state.provider} · {model}"))
 
 # Allow running standalone
