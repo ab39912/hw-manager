@@ -31,7 +31,6 @@ if not hasattr(st, "Page") or not hasattr(st, "navigation"):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HW4: iSchool Student Orgs RAG Chatbot (HTML corpus, vector DB built once)
-# Auto-builds the vector DB on first run if missing—no setup buttons.
 # Providers: OpenAI, Anthropic (Claude), Google (Gemini)
 # ─────────────────────────────────────────────────────────────────────────────
 import os
@@ -51,9 +50,9 @@ DB_PATH  = Path("data/ischool_vecdb.pkl")   # persisted vector db file
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # ── Embedding config
-EMBED_MODEL = "text-embedding-3-small"      # 1536-dim; cost-effective
-TOP_K = 5                                   # retrieved chunks per query (you can change in sidebar)
-MEMORY_TURNS = 5                            # keep last 5 Q&A turns
+EMBED_MODEL = "text-embedding-3-small"
+TOP_K = 5
+MEMORY_TURNS = 5
 PROVIDERS = ["OpenAI", "Anthropic", "Google"]
 
 # ── Model menus shown to the user (labels)
@@ -74,13 +73,13 @@ ANTHROPIC_MODELS = [
 GOOGLE_MODELS = [
     "Gemini-2.5-pro",
     "Gemini-2.5-flash",
-    "Gemini-2.5-flash-lite",  # label kept as requested; mapped to 'gemini-2.5-flash-lite'
+    "Gemini-2.5-flast-lite",  # label kept as requested; mapped to 'gemini-2.5-flash-lite'
 ]
 # label → API id mapping (lowercase; corrects 'flast' → 'flash')
 GOOGLE_MODEL_ID = {
     "Gemini-2.5-pro":        "gemini-2.5-pro",
     "Gemini-2.5-flash":      "gemini-2.5-flash",
-    "Gemini-2.5-flash-lite": "gemini-2.5-flash-lite",
+    "Gemini-2.5-flast-lite": "gemini-2.5-flash-lite",
 }
 
 SYSTEM_PROMPT = (
@@ -250,28 +249,51 @@ def format_context(hits: List[Dict[str, Any]]) -> str:
 # Provider calls (no hidden fallbacks)
 # ─────────────────────────────────────────────────────────────────────────────
 def call_openai(model: str, sys_prompt: str, history: List[Dict[str, str]]) -> str:
+    """
+    Some OpenAI models (e.g., gpt-5-nano) reject non-default temperature.
+    We therefore DO NOT pass temperature. If your account requires it elsewhere,
+    add a try/except with a re-issue including temperature.
+    """
     client = ensure_openai()
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role":"system","content":sys_prompt}] + history,
-        temperature=0.2,
-    )
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role":"system","content":sys_prompt}] + history,
+            # no temperature override
+        )
+    except Exception:
+        # Fallback (rare): attempt with explicit default temperature=1
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role":"system","content":sys_prompt}] + history,
+            temperature=1,
+        )
     return resp.choices[0].message.content
 
 def call_anthropic(model: str, sys_prompt: str, history: List[Dict[str, str]]) -> str:
+    """
+    Most Anthropic models accept temperature, but to be safe we try without it first
+    and only include temperature if needed.
+    """
     client = ensure_anthropic()
     msgs = [{"role": ("user" if m["role"] == "user" else "assistant"), "content": m["content"]} for m in history]
-    resp = client.messages.create(model=model, system=sys_prompt, temperature=0.2, max_tokens=1200, messages=msgs)
+    try:
+        resp = client.messages.create(model=model, system=sys_prompt, max_tokens=1200, messages=msgs)
+    except Exception:
+        resp = client.messages.create(model=model, system=sys_prompt, temperature=1, max_tokens=1200, messages=msgs)
     return "".join([b.text for b in resp.content if hasattr(b, "text")])
 
 def call_gemini(model_label: str, sys_prompt: str, history: List[Dict[str, str]]) -> str:
+    """
+    Some Gemini variants reject non-default temperature → we do NOT pass generation_config.
+    """
     mdl = ensure_gemini(model_label)  # resolves label → API id (lowercase)
     lines = [f"System:\n{sys_prompt}\n"]
     for m in history:
         role = "User" if m["role"] == "user" else "Assistant"
         lines.append(f"{role}:\n{m['content']}\n")
-    resp = mdl.generate_content("\n".join(lines), generation_config={"temperature": 0.2})
-    return resp.text or ""
+    resp = mdl.generate_content("\n".join(lines))  # use model default settings
+    return (getattr(resp, "text", None) or "").strip()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Session / UI
@@ -339,7 +361,7 @@ def run():
     if not user_q:
         return
 
-    # 👇 Show the user's message immediately so it doesn't feel like it "disappears"
+    # Show the user's message immediately
     with st.chat_message("user"):
         st.markdown(user_q)
 
