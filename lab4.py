@@ -60,20 +60,34 @@ OPENAI_MODELS = [
     "gpt-4o",
     "gpt-4o-mini",
 ]
+
+# Your requested Claude labels (UI) …
 ANTHROPIC_MODELS = [
-    "Opus 4-1-2025-08-25",
-    "Opus 4-2025-05-14",
-    "Sonnet 4-2025-05-14",
-    "3-Sonnet-2025",
-    "3-5-haiku",
-    "3-haiku-2024-03-07",
+    "Opus 4.1 (2025-08-05)",
+    "Opus 4 (2025-05-14)",
+    "Sonnet 4 (2025-05-14)",
+    "Sonnet 3.7 (2025-02-19)",
+    "Haiku 3.5 (2024-10-22)",
+    "Haiku 3 (2024-03-07)",
 ]
+
+# …mapped to **official Anthropic API IDs**
+ANTHROPIC_MODEL_ID = {
+    "Opus 4.1 (2025-08-05)":   "claude-opus-4-1-20250805",
+    "Opus 4 (2025-05-14)":     "claude-opus-4-20250514",
+    "Sonnet 4 (2025-05-14)":   "claude-sonnet-4-20250514",
+    "Sonnet 3.7 (2025-02-19)": "claude-3-7-sonnet-20250219",
+    "Haiku 3.5 (2024-10-22)":  "claude-3-5-haiku-20241022",
+    "Haiku 3 (2024-03-07)":    "claude-3-haiku-20240307",
+}
+
+# Google models (typo fixed: flash-lite)
 GOOGLE_MODELS = [
     "Gemini-2.5-pro",
     "Gemini-2.5-flash",
-    "Gemini-2.5-flash-lite",  # label kept as requested; mapped to 'gemini-2.5-flash-lite'
+    "Gemini-2.5-flash-lite",
 ]
-# label → API id mapping (lowercase; corrects 'flast' → 'flash')
+# label → API id mapping (lowercase)
 GOOGLE_MODEL_ID = {
     "Gemini-2.5-pro":        "gemini-2.5-pro",
     "Gemini-2.5-flash":      "gemini-2.5-flash",
@@ -91,7 +105,6 @@ SYSTEM_PROMPT = (
 # Secrets/env helper (accepts alternate names and falls back to env vars)
 # ─────────────────────────────────────────────────────────────────────────────
 def get_secret(*names: str) -> str:
-    """Return the first non-empty secret/env value among the provided names."""
     try:
         secrets = getattr(st, "secrets", {})
         for n in names:
@@ -130,11 +143,13 @@ def ensure_anthropic():
 def _google_api_id(label: str) -> str:
     return GOOGLE_MODEL_ID.get(label, label.lower())
 
+def _anthropic_api_id(label: str) -> str:
+    return ANTHROPIC_MODEL_ID.get(label, label)
+
 def ensure_gemini(model_label: str):
     api_id = _google_api_id(model_label)
     if api_id not in _gemini_model_cache:
         import google.generativeai as genai
-        # accept GEMINI_API_KEY in addition to GOOGLE_* names
         genai.configure(api_key=get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APIKEY", "GOOGLE_KEY"))
         _gemini_model_cache[api_id] = genai.GenerativeModel(api_id)
     return _gemini_model_cache[api_id]
@@ -152,9 +167,6 @@ def html_to_text(html: str) -> str:
     return "\n".join(lines)
 
 def two_chunk_split(text: str) -> List[str]:
-    """
-    EXACTLY TWO chunks per document using balanced sentence-halving.
-    """
     text = text.strip()
     if not text:
         return ["", ""]
@@ -215,7 +227,6 @@ def build_vecdb_in_memory(html_dir: Path) -> Dict[str, Any]:
     return {"embeddings": embs, "chunks": chunks, "metas": metas}
 
 def ensure_vecdb():
-    """Create the in-memory index once per session (no disk persistence)."""
     if "hw4_vecdb" not in st.session_state:
         with st.spinner("Indexing HTML corpus (one-time per session)…"):
             st.session_state.hw4_vecdb = build_vecdb_in_memory(HTML_DIR)
@@ -244,7 +255,7 @@ def format_context(hits: List[Dict[str, Any]]) -> str:
     return "\n\n---\n\n".join(parts)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Provider calls (no temperature overrides so all models work)
+# Provider calls (no forced temperature; robust Anthropic mapping)
 # ─────────────────────────────────────────────────────────────────────────────
 def call_openai(model: str, sys_prompt: str, history: List[Dict[str, str]]) -> str:
     client = ensure_openai()
@@ -254,7 +265,6 @@ def call_openai(model: str, sys_prompt: str, history: List[Dict[str, str]]) -> s
             messages=[{"role":"system","content":sys_prompt}] + history,
         )
     except Exception:
-        # Fallback with explicit default temp=1 if the account requires it
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role":"system","content":sys_prompt}] + history,
@@ -262,35 +272,34 @@ def call_openai(model: str, sys_prompt: str, history: List[Dict[str, str]]) -> s
         )
     return resp.choices[0].message.content
 
-def call_anthropic(model: str, sys_prompt: str, history: List[Dict[str, str]]) -> str:
+def call_anthropic(model_label: str, sys_prompt: str, history: List[Dict[str, str]]) -> str:
     client = ensure_anthropic()
+    api_id = _anthropic_api_id(model_label)
     msgs = [{"role": ("user" if m["role"] == "user" else "assistant"), "content": m["content"]} for m in history]
     try:
-        resp = client.messages.create(model=model, system=sys_prompt, max_tokens=1200, messages=msgs)
-    except Exception:
-        resp = client.messages.create(model=model, system=sys_prompt, temperature=1, max_tokens=1200, messages=msgs)
-    return "".join([b.text for b in resp.content if hasattr(b, "text")])
+        resp = client.messages.create(model=api_id, system=sys_prompt, max_tokens=1200, messages=msgs)
+        return "".join([b.text for b in resp.content if hasattr(b, "text")])
+    except Exception as e:
+        return f"Model error (Anthropic): {e}  [api id tried: {api_id}]"
 
 def call_gemini(model_label: str, sys_prompt: str, history: List[Dict[str, str]]) -> str:
-    mdl = ensure_gemini(model_label)  # resolves label → API id (lowercase)
+    mdl = ensure_gemini(model_label)
     lines = [f"System:\n{sys_prompt}\n"]
     for m in history:
         role = "User" if m["role"] == "user" else "Assistant"
         lines.append(f"{role}:\n{m['content']}\n")
-    resp = mdl.generate_content("\n".join(lines))  # use model default settings (no temperature override)
+    resp = mdl.generate_content("\n".join(lines))  # defaults (no temp override)
     return (getattr(resp, "text", None) or "").strip()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Session / UI
 # ─────────────────────────────────────────────────────────────────────────────
 def run():
-    # Ensure session defaults
     if "chat" not in st.session_state:
-        st.session_state.chat = deque(maxlen=MEMORY_TURNS)   # (user, assistant, model_tag)
+        st.session_state.chat = deque(maxlen=MEMORY_TURNS)
     if "provider" not in st.session_state:
         st.session_state.provider = "OpenAI"
 
-    # Build in-memory index once per session (no files created)
     ensure_vecdb()
 
     st.title("🎓 HW4: iSchool Student Orgs RAG Chatbot")
@@ -298,9 +307,7 @@ def run():
 
     with st.sidebar:
         st.header("🤖 Provider & Model")
-        prov_default = st.session_state.get("provider", "OpenAI")
-        provider = st.selectbox("Provider", PROVIDERS,
-                                index=(PROVIDERS.index(prov_default) if prov_default in PROVIDERS else 0))
+        provider = st.selectbox("Provider", PROVIDERS, index=PROVIDERS.index(st.session_state.provider))
         st.session_state.provider = provider
 
         if provider == "OpenAI":
@@ -311,12 +318,12 @@ def run():
             model = st.selectbox("Model", ANTHROPIC_MODELS, index=0)
             if not get_secret("ANTHROPIC_API_KEY", "ANTHROPIC_KEY"):
                 st.warning("Missing ANTHROPIC_API_KEY (or ANTHROPIC_KEY).")
+            st.caption(f"API id → `{_anthropic_api_id(model)}`")
         else:
-            model = st.selectbox("Model", GOOGLE_MODELS, index=0)  # label
+            model = st.selectbox("Model", GOOGLE_MODELS, index=0)
             if not get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APIKEY", "GOOGLE_KEY"):
                 st.warning("Missing GEMINI_API_KEY (or GOOGLE_API_KEY).")
-            api_id = GOOGLE_MODEL_ID.get(model, model.lower())
-            st.caption(f"API id → `{api_id}`")
+            st.caption(f"API id → `{_google_api_id(model)}`")
 
         st.divider()
         top_k = st.slider("Retrieved chunks (k)", 2, 8, TOP_K, 1)
@@ -328,19 +335,17 @@ def run():
             except Exception as e:
                 st.error(f"Rebuild failed: {e}")
 
-    # Render last turns
+    # Render past turns
     for u, a, tag in list(st.session_state.chat):
         with st.chat_message("user"):
             st.markdown(u)
         with st.chat_message("assistant"):
             st.markdown(f"_{tag}_\n\n{a}")
 
-    # Current user input
+    # Current turn
     user_q = st.chat_input("Type your question…")
     if not user_q:
         return
-
-    # Show user's message immediately
     with st.chat_message("user"):
         st.markdown(user_q)
 
@@ -364,11 +369,11 @@ def run():
             elif st.session_state.provider == "Anthropic":
                 ans = call_anthropic(model, SYSTEM_PROMPT, history)
             else:
-                ans = call_gemini(model, SYSTEM_PROMPT, history)  # label; mapping happens inside
+                ans = call_gemini(model, SYSTEM_PROMPT, history)
         except Exception as e:
             ans = f"⚠️ Model error: {e}"
 
-        # Show quick source previews
+        # Show sources preview
         if hits:
             previews = []
             for i, h in enumerate(hits, start=1):
@@ -382,9 +387,7 @@ def run():
 
         st.markdown(f"_{st.session_state.provider} · {model}_\n\n{ans}")
 
-    # Save to short-term memory
     st.session_state.chat.append((user_q, ans, f"{st.session_state.provider} · {model}"))
 
-# Allow running standalone
 if __name__ == "__main__":
     run()
