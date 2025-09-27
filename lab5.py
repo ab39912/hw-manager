@@ -11,6 +11,14 @@ from openai import OpenAI, BadRequestError
 import chromadb
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 
+
+try:
+    import pysqlite3
+    import sys as _sys
+    _sys.modules["sqlite3"] = _sys.modules.pop("pysqlite3")
+except Exception:
+    pass
+
 # ======================
 # Config
 # ======================
