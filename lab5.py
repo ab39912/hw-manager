@@ -1,44 +1,37 @@
-# HW5.py — RAG chatbot with short-term memory, multi-LLM, and robust Chroma handling
+# HW5.py — RAG chatbot with short-term memory & multi-LLM switcher (OpenAI, Gemini, Claude)
 
-# ── SQLite shim (Chroma requires sqlite>=3.35; this swaps in pysqlite3 if available)
+# ── SQLite shim (Chroma needs sqlite>=3.35)
 try:
     import pysqlite3
     import sys as _sys
     _sys.modules["sqlite3"] = _sys.modules.pop("pysqlite3")
 except Exception:
-    pass  # If not available, Chroma may error later on old sqlite
+    pass
 
-import os, glob, shutil, textwrap
+import os, glob, textwrap
 from typing import List, Tuple, Dict
 
 import streamlit as st
 
-# Optional provider SDKs (we check presence at runtime)
+# Optional SDKs (we’ll check availability at runtime)
 try:
-    from openai import OpenAI, BadRequestError
+    from openai import OpenAI, BadRequestError  # OpenAI
 except Exception:
     OpenAI, BadRequestError = None, Exception
-
 try:
-    import google.generativeai as genai
+    import google.generativeai as genai            # Gemini
 except Exception:
     genai = None
-
 try:
-    import anthropic
+    import anthropic                               # Claude
 except Exception:
     anthropic = None
 
 import chromadb
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
-from chromadb.config import Settings
-from chromadb.errors import InternalError
 from pypdf import PdfReader
 
-
-# ─────────────────────────────────────────
-# App Defaults
-# ─────────────────────────────────────────
+# ── App config
 DEFAULT_PDF_DIR   = "lab4_pdfs"
 DEFAULT_DB_PATH   = ".chroma_hw5"
 DEFAULT_COLL_NAME = "HW5Collection"
@@ -47,7 +40,6 @@ TOP_K = 3
 PAGE_CHUNK_SIZE = 2000
 CHARS_PER_DOC = 1200
 BATCH_SIZE = 64
-MEMORY_TURNS = 8  # keep last N turns total
 
 SYSTEM_PROMPT = (
     "You are a helpful Course Information Assistant.\n"
@@ -55,33 +47,24 @@ SYSTEM_PROMPT = (
     "Be concise; cite doc filenames and page numbers if you used them."
 )
 
+# ── Model registries
 GPT_MODELS = ["gpt-5-nano", "gpt-5-chat-latest"]
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 CLAUDE_MODELS = [
-    "claude-opus-4-1-20250805",
-    "claude-sonnet-4-20250514",
-    "claude-3-5-haiku-20241022",
+    "claude-opus-4-1-20250805",   # Opus 4.1 (2025-08-05)
+    "claude-sonnet-4-20250514",   # Sonnet 4 (2025-05-14)
+    "claude-3-5-haiku-20241022",  # Haiku 3.5 (2024-10-22)
 ]
 
-
 # ─────────────────────────────────────────
-# Chroma helpers (with auto-heal for tenant migration)
+# Chroma helpers
 # ─────────────────────────────────────────
 def _embedding_fn(openai_api_key: str):
-    # We use OpenAI embeddings for Chroma regardless of chat provider
+    # We use OpenAI embeddings for Chroma regardless of the generation model
     return OpenAIEmbeddingFunction(api_key=openai_api_key, model_name="text-embedding-3-small")
 
-def _client(db_path: str) -> chromadb.Client:
-    os.makedirs(db_path, exist_ok=True)
-    try:
-        return chromadb.PersistentClient(path=db_path, settings=Settings(allow_reset=True))
-    except InternalError as e:
-        # Auto-heal common migration issue: "no such table: tenants"
-        if "no such table: tenants" in str(e).lower():
-            shutil.rmtree(db_path, ignore_errors=True)
-            os.makedirs(db_path, exist_ok=True)
-            return chromadb.PersistentClient(path=db_path, settings=Settings(allow_reset=True))
-        raise
+def _client(db_path: str):
+    return chromadb.PersistentClient(path=db_path)
 
 def _get_or_create_collection(db_path: str, coll_name: str, openai_api_key: str):
     client = _client(db_path)
@@ -92,10 +75,7 @@ def _get_or_create_collection(db_path: str, coll_name: str, openai_api_key: str)
         metadata={"hnsw:space": "cosine"},
     )
 
-
-# ─────────────────────────────────────────
-# PDF → chunks
-# ─────────────────────────────────────────
+# ── PDF → chunks
 def _pdf_to_page_texts(path: str) -> List[str]:
     reader = PdfReader(path)
     return [(page.extract_text() or "").strip() for page in reader.pages]
@@ -127,22 +107,18 @@ def _pdf_to_chunks_with_meta(path: str) -> List[Tuple[str, Dict]]:
             results.append((chunk, {"filename": filename, "page": p_idx, "chunk": c_idx}))
     return results
 
-
-# ─────────────────────────────────────────
-# Build collection
-# ─────────────────────────────────────────
+# ── Build collection
 def build_vector_db(pdf_dir: str, db_path: str, coll_name: str, openai_api_key: str) -> int:
     collection = _get_or_create_collection(db_path, coll_name, openai_api_key)
     try:
-        existing = collection.count() or 0
-        if existing > 0:
-            return existing
+        if (collection.count() or 0) > 0:
+            return collection.count()
     except Exception:
         pass
 
     pdfs = sorted(glob.glob(os.path.join(pdf_dir, "*.pdf")))
     if not pdfs:
-        st.error(f"No PDFs found in '{pdf_dir}'. Put your course PDFs there or change the path in sidebar.")
+        st.error(f"No PDFs found in '{pdf_dir}'. Put your 7 course PDFs there or change the path in sidebar.")
         st.stop()
 
     texts, metas, ids = [], [], []
@@ -160,10 +136,7 @@ def build_vector_db(pdf_dir: str, db_path: str, coll_name: str, openai_api_key: 
         )
     return _get_or_create_collection(db_path, coll_name, openai_api_key).count()
 
-
-# ─────────────────────────────────────────
-# Retrieval
-# ─────────────────────────────────────────
+# ── Retrieval
 def retrieve_context(query: str, db_path: str, coll_name: str, openai_api_key: str, n_results: int = TOP_K):
     collection = _get_or_create_collection(db_path, coll_name, openai_api_key)
     res = collection.query(query_texts=[query], n_results=n_results)
@@ -180,9 +153,9 @@ def retrieve_context(query: str, db_path: str, coll_name: str, openai_api_key: s
         parts.append(f"[{label}]\n{textwrap.dedent(doc[:CHARS_PER_DOC]).strip()}")
     return used_labels, "\n\n---\n\n".join(parts)
 
-
 # ─────────────────────────────────────────
-# Multi-LLM unified chat wrapper
+# Multi-LLM: unified chat() wrapper
+# messages format expected: [{"role":"system"|"user"|"assistant","content":str}]
 # ─────────────────────────────────────────
 def chat_with_model(provider: str, model: str, messages: list) -> str:
     if provider == "OpenAI":
@@ -190,7 +163,7 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
             raise RuntimeError("openai SDK not installed.")
         api_key = st.secrets.get("OPENAI_API_KEY")
         if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing.")
+            raise RuntimeError("Missing OPENAI_API_KEY in .streamlit/secrets.toml")
         client = OpenAI(api_key=api_key)
         resp = client.chat.completions.create(model=model, messages=messages)
         return resp.choices[0].message.content
@@ -200,10 +173,10 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
             raise RuntimeError("google-generativeai SDK not installed.")
         api_key = st.secrets.get("GEMINI_API_KEY")
         if not api_key:
-            raise RuntimeError("GEMINI_API_KEY is missing.")
+            raise RuntimeError("Missing GEMINI_API_KEY in .streamlit/secrets.toml")
         genai.configure(api_key=api_key)
 
-        # Convert OpenAI-style messages to Gemini request
+        # Convert OpenAI-style messages to Gemini parts
         sys_prompt = ""
         convo = []
         for m in messages:
@@ -215,6 +188,7 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
             else:
                 convo.append({"role": "model", "parts": [content]})
         if sys_prompt:
+            # Prepend system into the first user turn
             if convo and convo[0]["role"] == "user":
                 convo[0]["parts"] = [sys_prompt + convo[0]["parts"][0]]
             else:
@@ -222,6 +196,7 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
 
         model_obj = genai.GenerativeModel(model)
         resp = model_obj.generate_content(convo, safety_settings=None)
+        # Gemini SDK may stream; here we assume non-stream call
         return getattr(resp, "text", "").strip()
 
     elif provider == "Anthropic":
@@ -229,7 +204,7 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
             raise RuntimeError("anthropic SDK not installed.")
         api_key = st.secrets.get("ANTHROPIC_API_KEY")
         if not api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY is missing.")
+            raise RuntimeError("Missing ANTHROPIC_API_KEY in .streamlit/secrets.toml")
         client = anthropic.Anthropic(api_key=api_key)
 
         # Split out system
@@ -241,6 +216,7 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
             elif m["role"] in ("user", "assistant"):
                 converted.append({"role": m["role"], "content": m["content"]})
         resp = client.messages.create(model=model, max_tokens=1024, system=system_text.strip(), messages=converted)
+        # Claude returns content as a list of blocks
         parts = resp.content or []
         for p in parts:
             if hasattr(p, "text"):
@@ -252,10 +228,7 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
     else:
         raise RuntimeError(f"Unknown provider: {provider}")
 
-
-# ─────────────────────────────────────────
-# Prompt builder
-# ─────────────────────────────────────────
+# ── Prompt builder
 def build_messages(user_query: str, context_block: str, history: list):
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     for role, text in history:
@@ -277,13 +250,13 @@ def build_messages(user_query: str, context_block: str, history: list):
     msgs.append({"role": "user", "content": user})
     return msgs
 
-
 # ─────────────────────────────────────────
 # Streamlit UI
 # ─────────────────────────────────────────
 def run():
     st.title("🗒️ HW5: Intelligent Chatbot with Short-Term Memory (Multi-LLM)")
 
+    # Sidebar: RAG + Model settings
     with st.sidebar:
         st.header("RAG Settings")
         pdf_dir = st.text_input("PDF folder", value=DEFAULT_PDF_DIR)
@@ -291,25 +264,18 @@ def run():
         coll_name = st.text_input("Collection name", value=DEFAULT_COLL_NAME)
         force_rebuild = st.checkbox("Force rebuild from PDFs", value=False)
 
-        # Quick DB reset button (helps recover from corruption / version mismatch)
-        if st.button("🧹 Reset Chroma DB (delete & rebuild)"):
-            shutil.rmtree(db_path, ignore_errors=True)
-            st.success("Deleted DB folder. Toggle 'Force rebuild from PDFs' and ask again.")
-
         st.header("Model Provider")
         provider = st.radio("Provider", ["OpenAI", "Gemini", "Anthropic"], index=0)
+
         if provider == "OpenAI":
             model = st.selectbox("Model", GPT_MODELS, index=0)
-            if not st.secrets.get("OPENAI_API_KEY"):
-                st.warning("Needs OPENAI_API_KEY")
+            st.caption("OPENAI_API_KEY")
         elif provider == "Gemini":
             model = st.selectbox("Model", GEMINI_MODELS, index=0)
-            if not st.secrets.get("GEMINI_API_KEY"):
-                st.warning("Needs GEMINI_API_KEY")
+            st.caption("GEMINI_API_KEY")
         else:
             model = st.selectbox("Model", CLAUDE_MODELS, index=1)
-            if not st.secrets.get("ANTHROPIC_API_KEY"):
-                st.warning("Needs ANTHROPIC_API_KEY")
+            st.caption("ANTHROPIC_API_KEY")
 
         st.divider()
         if st.button("Diagnostics"):
@@ -317,24 +283,13 @@ def run():
                 coll = _get_or_create_collection(db_path, coll_name, st.secrets.get("OPENAI_API_KEY", ""))
                 count = coll.count() or 0
                 st.info(f"Collection `{coll_name}` has {count} vectors.")
-                if count == 0:
-                    st.warning("No vectors: build from PDFs.")
             except Exception as e:
                 st.error(f"Collection error: {e}")
 
-        # Show embeddings key warning only if missing (used for retrieval)
-        if not st.secrets.get("OPENAI_API_KEY"):
-            st.info("OpenAI embeddings are required for retrieval (set OPENAI_API_KEY).")
-
-        # Optional: Secrets status expander (remove if you don’t want it)
-        with st.expander("🔐 Secrets status", expanded=False):
-            st.write("OPENAI_API_KEY:", bool(st.secrets.get("OPENAI_API_KEY")))
-            st.write("GEMINI_API_KEY:", bool(st.secrets.get("GEMINI_API_KEY")))
-            st.write("ANTHROPIC_API_KEY:", bool(st.secrets.get("ANTHROPIC_API_KEY")))
-
-    # Ensure embeddings key exists for Chroma (stop early if missing)
+    # Ensure embeddings key exists even if generation uses a different provider
     openai_embed_key = st.secrets.get("OPENAI_API_KEY")
     if not openai_embed_key:
+        st.error("Embeddings require OPENAI_API_KEY in `.streamlit/secrets.toml` (used for Chroma).")
         st.stop()
 
     # Build / rebuild vector DB if needed
@@ -350,6 +305,9 @@ def run():
     # Short-term memory
     if "hw5_history" not in st.session_state:
         st.session_state.hw5_history = []  # list[(role, content)]
+    # Optional: cap to last N turns to keep prompts lean
+    def trim_history(n=8):
+        st.session_state.hw5_history = st.session_state.hw5_history[-n:]
 
     # Render prior turns
     for role, text in st.session_state.hw5_history:
@@ -385,9 +343,9 @@ def run():
             st.error(f"{provider} error: {e}")
             return
 
-    # Save assistant reply & trim memory window
+    # Save and trim memory
     st.session_state.hw5_history.append(("assistant", answer))
-    st.session_state.hw5_history = st.session_state.hw5_history[-MEMORY_TURNS:]
+    trim_history(8)  # keep last 8 turns total
 
 if __name__ == "__main__":
     run()
