@@ -1,19 +1,20 @@
-# HW5.py — RAG chatbot with short-term memory, multi-LLM switcher, and robust Chroma handling
+# HW5.py — RAG chatbot with short-term memory, multi-LLM switcher,
+# and robust Chroma handling (Persistent/Ephemeral with auto-fallback)
 
-# ── SQLite shim (Chroma requires sqlite>=3.35; this swaps in pysqlite3 if available)
+# ── SQLite shim (lets Chroma use modern sqlite via pysqlite3 if available)
 try:
-    import pysqlite3
+    import pysqlite3  # ships newer SQLite
     import sys as _sys
     _sys.modules["sqlite3"] = _sys.modules.pop("pysqlite3")
 except Exception:
-    pass  # If not available, Chroma may error later on old sqlite
+    pass  # If not present, Persistent mode may error on very old sqlite
 
 import os, glob, shutil, textwrap
 from typing import List, Tuple, Dict
 
 import streamlit as st
 
-# Optional provider SDKs (loaded if installed)
+# Provider SDKs (optional; we check presence at runtime)
 try:
     from openai import OpenAI, BadRequestError
 except Exception:
@@ -33,9 +34,8 @@ import chromadb
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from pypdf import PdfReader
 
-
 # ─────────────────────────────────────────
-# App Defaults
+# App defaults
 # ─────────────────────────────────────────
 DEFAULT_PDF_DIR   = "lab4_pdfs"
 DEFAULT_DB_PATH   = ".chroma_hw5"
@@ -61,34 +61,37 @@ CLAUDE_MODELS = [
     "claude-3-5-haiku-20241022",
 ]
 
-
 # ─────────────────────────────────────────
-# Chroma helpers (singleton via cache_resource)
+# Embeddings (OpenAI; required for Chroma)
 # ─────────────────────────────────────────
 def _embedding_fn(openai_api_key: str):
-    # We use OpenAI embeddings for Chroma regardless of chat provider
     return OpenAIEmbeddingFunction(api_key=openai_api_key, model_name="text-embedding-3-small")
 
+# ─────────────────────────────────────────
+# Chroma client (Persistent/Ephemeral) — singleton via cache_resource
+# ─────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
-def _client(db_path: str) -> chromadb.Client:
+def _client(storage_mode: str, db_path: str) -> chromadb.Client:
     """
-    Return a single cached PersistentClient per db_path.
-    IMPORTANT:
-      - Do NOT pass Settings(...) here; differing settings across reruns can trigger
-        'An instance of Chroma already exists ... with different settings'.
+    Returns a single cached Chroma client:
+      - 'persistent': PersistentClient(path=db_path)
+      - 'ephemeral' : EphemeralClient()
+    We DO NOT pass Settings(...) to avoid 'different settings' errors in Streamlit.
     """
-    os.makedirs(db_path, exist_ok=True)
-    return chromadb.PersistentClient(path=db_path)
+    if storage_mode == "persistent":
+        os.makedirs(db_path, exist_ok=True)
+        return chromadb.PersistentClient(path=db_path)
+    else:
+        return chromadb.EphemeralClient()
 
-def _get_or_create_collection(db_path: str, coll_name: str, openai_api_key: str):
-    client = _client(db_path)
+def _get_or_create_collection(storage_mode: str, db_path: str, coll_name: str, openai_api_key: str):
+    client = _client(storage_mode, db_path)
     emb = _embedding_fn(openai_api_key)
     return client.get_or_create_collection(
         name=coll_name,
         embedding_function=emb,
-        metadata={"hnsw:space": "cosine"},  # keep consistent across runs
+        metadata={"hnsw:space": "cosine"},
     )
-
 
 # ─────────────────────────────────────────
 # PDF → chunks
@@ -124,12 +127,11 @@ def _pdf_to_chunks_with_meta(path: str) -> List[Tuple[str, Dict]]:
             results.append((chunk, {"filename": filename, "page": p_idx, "chunk": c_idx}))
     return results
 
-
 # ─────────────────────────────────────────
 # Build collection
 # ─────────────────────────────────────────
-def build_vector_db(pdf_dir: str, db_path: str, coll_name: str, openai_api_key: str) -> int:
-    collection = _get_or_create_collection(db_path, coll_name, openai_api_key)
+def build_vector_db(storage_mode: str, pdf_dir: str, db_path: str, coll_name: str, openai_api_key: str) -> int:
+    collection = _get_or_create_collection(storage_mode, db_path, coll_name, openai_api_key)
     try:
         existing = collection.count() or 0
         if existing > 0:
@@ -152,19 +154,16 @@ def build_vector_db(pdf_dir: str, db_path: str, coll_name: str, openai_api_key: 
     total = len(texts)
     for i in range(0, total, BATCH_SIZE):
         j = min(i + BATCH_SIZE, total)
-        _get_or_create_collection(db_path, coll_name, openai_api_key).add(
+        _get_or_create_collection(storage_mode, db_path, coll_name, openai_api_key).add(
             ids=ids[i:j], documents=texts[i:j], metadatas=metas[i:j]
         )
-    return _get_or_create_collection(db_path, coll_name, openai_api_key).count()
-
+    return _get_or_create_collection(storage_mode, db_path, coll_name, openai_api_key).count()
 
 # ─────────────────────────────────────────
 # Retrieval
 # ─────────────────────────────────────────
-def retrieve_context(query: str, db_path: str, coll_name: str, openai_api_key: str, n_results: int = TOP_K):
-    # If the on-disk DB was made by a different Chroma version and errors,
-    # instruct user to use Reset button; we keep this call simple to avoid shared-system issues.
-    collection = _get_or_create_collection(db_path, coll_name, openai_api_key)
+def retrieve_context(query: str, storage_mode: str, db_path: str, coll_name: str, openai_api_key: str, n_results: int = TOP_K):
+    collection = _get_or_create_collection(storage_mode, db_path, coll_name, openai_api_key)
     res = collection.query(query_texts=[query], n_results=n_results)
 
     metadatas = res.get("metadatas", [[]])[0] if res.get("metadatas") else []
@@ -178,7 +177,6 @@ def retrieve_context(query: str, db_path: str, coll_name: str, openai_api_key: s
         used_labels.append(label)
         parts.append(f"[{label}]\n{textwrap.dedent(doc[:CHARS_PER_DOC]).strip()}")
     return used_labels, "\n\n---\n\n".join(parts)
-
 
 # ─────────────────────────────────────────
 # Multi-LLM unified chat wrapper
@@ -251,7 +249,6 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
     else:
         raise RuntimeError(f"Unknown provider: {provider}")
 
-
 # ─────────────────────────────────────────
 # Prompt builder
 # ─────────────────────────────────────────
@@ -276,7 +273,6 @@ def build_messages(user_query: str, context_block: str, history: list):
     msgs.append({"role": "user", "content": user})
     return msgs
 
-
 # ─────────────────────────────────────────
 # Streamlit UI
 # ─────────────────────────────────────────
@@ -288,15 +284,17 @@ def run():
         pdf_dir = st.text_input("PDF folder", value=DEFAULT_PDF_DIR)
         db_path = st.text_input("Chroma path", value=DEFAULT_DB_PATH)
         coll_name = st.text_input("Collection name", value=DEFAULT_COLL_NAME)
+        storage_mode = st.radio("Storage backend", ["persistent", "ephemeral"], index=0,
+                                help="Use 'ephemeral' if persistent throws tenant/database errors on Streamlit Cloud.")
         force_rebuild = st.checkbox("Force rebuild from PDFs", value=False)
 
-        # Quick DB reset button (helps recover from corruption / version mismatch)
-        if st.button("🧹 Reset Chroma DB (delete & rebuild)"):
+        # Reset DB (Persistent only)
+        if storage_mode == "persistent" and st.button("🧹 Reset Persistent DB"):
             try:
-                st.cache_resource.clear()          # clear cached client
+                st.cache_resource.clear()  # clear cached client
                 shutil.rmtree(db_path, ignore_errors=True)
                 os.makedirs(db_path, exist_ok=True)
-                st.success("Chroma DB reset. Toggle 'Force rebuild from PDFs' and ask again.")
+                st.success("Persistent DB reset. Toggle 'Force rebuild' and ask again.")
             except Exception as e:
                 st.error(f"Reset failed: {e}")
 
@@ -319,7 +317,7 @@ def run():
         st.divider()
         if st.button("Diagnostics"):
             try:
-                coll = _get_or_create_collection(db_path, coll_name, st.secrets.get("OPENAI_API_KEY", ""))
+                coll = _get_or_create_collection(storage_mode, db_path, coll_name, st.secrets.get("OPENAI_API_KEY", ""))
                 count = coll.count() or 0
                 st.info(f"Collection `{coll_name}` has {count} vectors.")
                 if count == 0:
@@ -327,7 +325,7 @@ def run():
             except Exception as e:
                 st.error(f"Collection error: {e}")
 
-        # Show embeddings key warning only if missing (used for retrieval)
+        # Embeddings key warning only if missing (used for retrieval)
         if not st.secrets.get("OPENAI_API_KEY"):
             st.info("OpenAI embeddings are required for retrieval (set OPENAI_API_KEY).")
 
@@ -336,20 +334,27 @@ def run():
     if not openai_embed_key:
         st.stop()
 
-    # Build / rebuild vector DB if needed
-    coll = _get_or_create_collection(db_path, coll_name, openai_embed_key)
+    # Try to create/access collection; if Persistent explodes, auto-fallback to Ephemeral once
     try:
+        coll = _get_or_create_collection(storage_mode, db_path, coll_name, openai_embed_key)
         current_count = coll.count() or 0
-    except Exception:
-        current_count = 0
-    need_build = force_rebuild or current_count == 0
+    except Exception as e:
+        if storage_mode == "persistent":
+            st.warning(f"Persistent backend failed ({e}). Falling back to Ephemeral (in-memory).")
+            storage_mode = "ephemeral"
+            st.cache_resource.clear()
+            coll = _get_or_create_collection(storage_mode, db_path, coll_name, openai_embed_key)
+            current_count = coll.count() or 0
+        else:
+            raise
 
+    need_build = force_rebuild or current_count == 0
     if need_build:
-        with st.status("Building vector DB from PDFs…", expanded=True) as status:
-            count = build_vector_db(pdf_dir, db_path, coll_name, openai_embed_key)
-            status.update(label=f"Vector DB ready with {count} chunks.", state="complete")
+        with st.status(f"Building vector DB from PDFs ({storage_mode})…", expanded=True) as status:
+            count = build_vector_db(storage_mode, pdf_dir, db_path, coll_name, openai_embed_key)
+            status.update(label=f"Vector DB ready with {count} chunks (mode: {storage_mode}).", state="complete")
     else:
-        st.caption(f"Vector DB OK — `{coll_name}` has {current_count} chunks.")
+        st.caption(f"Vector DB OK — `{coll_name}` has {current_count} chunks (mode: {storage_mode}).")
 
     # Short-term memory
     if "hw5_history" not in st.session_state:
@@ -371,7 +376,7 @@ def run():
         st.markdown(user_query)
 
     # Retrieve
-    used_labels, context_block = retrieve_context(user_query, db_path, coll_name, openai_embed_key, n_results=TOP_K)
+    used_labels, context_block = retrieve_context(user_query, storage_mode, db_path, coll_name, openai_embed_key, n_results=TOP_K)
 
     # Build messages & call selected model
     messages = build_messages(user_query, context_block, st.session_state.hw5_history)
