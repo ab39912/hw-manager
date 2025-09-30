@@ -8,7 +8,7 @@ try:
 except Exception:
     pass
 
-import os, glob, textwrap
+import os, glob, textwrap, tempfile
 from typing import List, Tuple, Dict
 
 import streamlit as st
@@ -28,6 +28,7 @@ except Exception:
     anthropic = None
 
 import chromadb
+from chromadb.config import Settings
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from pypdf import PdfReader
 
@@ -63,8 +64,38 @@ def _embedding_fn(openai_api_key: str):
     # We use OpenAI embeddings for Chroma regardless of the generation model
     return OpenAIEmbeddingFunction(api_key=openai_api_key, model_name="text-embedding-3-small")
 
+def _ensure_writable_dir(path: str) -> str:
+    """Return a guaranteed-writable directory for Chroma.
+    If `path` isn't writable, fall back to OS temp (/tmp on Linux)."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".write_probe")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return path
+    except Exception:
+        fallback = os.path.join(tempfile.gettempdir(), "chroma_hw5")
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
 def _client(db_path: str):
-    return chromadb.PersistentClient(path=db_path)
+    # Resolve to an absolute, writable path; auto-fallback if needed
+    raw = os.path.abspath(db_path or DEFAULT_DB_PATH)
+    safe = _ensure_writable_dir(raw)
+    if "chroma_effective_path" not in st.session_state:
+        st.session_state.chroma_effective_path = safe
+    else:
+        st.session_state.chroma_effective_path = safe
+    if safe != raw:
+        st.warning(f"Chroma DB path `{raw}` was not writable; using `{safe}` instead.")
+    return chromadb.PersistentClient(
+        path=safe,
+        settings=Settings(
+            anonymized_telemetry=False,
+            allow_reset=True,
+        ),
+    )
 
 def _get_or_create_collection(db_path: str, coll_name: str, openai_api_key: str):
     client = _client(db_path)
@@ -108,17 +139,27 @@ def _pdf_to_chunks_with_meta(path: str) -> List[Tuple[str, Dict]]:
     return results
 
 # ── Build collection
-def build_vector_db(pdf_dir: str, db_path: str, coll_name: str, openai_api_key: str) -> int:
+def build_vector_db(pdf_dir: str, db_path: str, coll_name: str, openai_api_key: str, force_rebuild: bool = False) -> int:
     collection = _get_or_create_collection(db_path, coll_name, openai_api_key)
+
+    # If force rebuild, reset the collection
+    if force_rebuild:
+        try:
+            collection.reset()
+        except Exception as e:
+            st.warning(f"Could not reset collection; proceeding to rebuild. ({e})")
+
+    # If already populated, return count
     try:
-        if (collection.count() or 0) > 0:
+        if not force_rebuild and (collection.count() or 0) > 0:
             return collection.count()
     except Exception:
+        # In case .count() throws due to a stale/locked db, continue to rebuild
         pass
 
     pdfs = sorted(glob.glob(os.path.join(pdf_dir, "*.pdf")))
     if not pdfs:
-        st.error(f"No PDFs found in '{pdf_dir}'. Put your 7 course PDFs there or change the path in sidebar.")
+        st.error(f"No PDFs found in '{pdf_dir}'. Put your course PDFs there or change the path in the sidebar.")
         st.stop()
 
     texts, metas, ids = [], [], []
@@ -131,6 +172,7 @@ def build_vector_db(pdf_dir: str, db_path: str, coll_name: str, openai_api_key: 
     total = len(texts)
     for i in range(0, total, BATCH_SIZE):
         j = min(i + BATCH_SIZE, total)
+        # Re-fetch collection to avoid stale client issues in some environments
         _get_or_create_collection(db_path, coll_name, openai_api_key).add(
             ids=ids[i:j], documents=texts[i:j], metadatas=metas[i:j]
         )
@@ -182,21 +224,19 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
         for m in messages:
             role, content = m["role"], m["content"]
             if role == "system":
-                sys_prompt += content.strip() + "\n\n"
+                sys_prompt += (content or "").strip() + "\n\n"
             elif role == "user":
                 convo.append({"role": "user", "parts": [content]})
             else:
                 convo.append({"role": "model", "parts": [content]})
         if sys_prompt:
-            # Prepend system into the first user turn
             if convo and convo[0]["role"] == "user":
-                convo[0]["parts"] = [sys_prompt + convo[0]["parts"][0]]
+                convo[0]["parts"] = [sys_prompt + (convo[0]["parts"][0] or "")]
             else:
                 convo.insert(0, {"role": "user", "parts": [sys_prompt]})
 
         model_obj = genai.GenerativeModel(model)
         resp = model_obj.generate_content(convo, safety_settings=None)
-        # Gemini SDK may stream; here we assume non-stream call
         return getattr(resp, "text", "").strip()
 
     elif provider == "Anthropic":
@@ -215,9 +255,14 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
                 system_text += (m["content"] or "") + "\n"
             elif m["role"] in ("user", "assistant"):
                 converted.append({"role": m["role"], "content": m["content"]})
-        resp = client.messages.create(model=model, max_tokens=1024, system=system_text.strip(), messages=converted)
+        resp = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            system=system_text.strip(),
+            messages=converted
+        )
         # Claude returns content as a list of blocks
-        parts = resp.content or []
+        parts = getattr(resp, "content", []) or []
         for p in parts:
             if hasattr(p, "text"):
                 return p.text
@@ -269,15 +314,16 @@ def run():
 
         if provider == "OpenAI":
             model = st.selectbox("Model", GPT_MODELS, index=0)
-            st.caption("Needs OPENAI_API_KEY")
+            st.caption("OPENAI_API_KEY")
         elif provider == "Gemini":
             model = st.selectbox("Model", GEMINI_MODELS, index=0)
-            st.caption("Needs GEMINI_API_KEY")
+            st.caption("GEMINI_API_KEY")
         else:
             model = st.selectbox("Model", CLAUDE_MODELS, index=1)
-            st.caption("Needs ANTHROPIC_API_KEY")
+            st.caption("ANTHROPIC_API_KEY")
 
         st.divider()
+        # Diagnostics (shows collection count)
         if st.button("Diagnostics"):
             try:
                 coll = _get_or_create_collection(db_path, coll_name, st.secrets.get("OPENAI_API_KEY", ""))
@@ -286,18 +332,37 @@ def run():
             except Exception as e:
                 st.error(f"Collection error: {e}")
 
+        st.divider()
+        # Optional: Reset DB quickly
+        if st.button("Reset DB (clear collection)"):
+            try:
+                coll = _get_or_create_collection(db_path, coll_name, st.secrets.get("OPENAI_API_KEY", ""))
+                coll.reset()
+                st.success("Collection reset. Toggle 'Force rebuild' and send a query to re-index.")
+            except Exception as e:
+                st.error(f"Reset failed: {e}")
+
     # Ensure embeddings key exists even if generation uses a different provider
     openai_embed_key = st.secrets.get("OPENAI_API_KEY")
     if not openai_embed_key:
         st.error("Embeddings require OPENAI_API_KEY in `.streamlit/secrets.toml` (used for Chroma).")
         st.stop()
 
-    # Build / rebuild vector DB if needed
-    coll = _get_or_create_collection(db_path, coll_name, openai_embed_key)
+    # Build / rebuild vector DB (with robust fallback on read-only paths)
+    try:
+        coll = _get_or_create_collection(db_path, coll_name, openai_embed_key)
+    except Exception as e:
+        st.warning(f"Chroma init failed at `{db_path}` ({e}). Retrying in a temp folder…")
+        tmp_path = os.path.join(tempfile.gettempdir(), "chroma_hw5")
+        coll = _get_or_create_collection(tmp_path, coll_name, openai_embed_key)
+        db_path = tmp_path  # ensure subsequent calls use the working path
+
+    st.caption(f"Chroma path in use: `{st.session_state.get('chroma_effective_path', os.path.abspath(db_path))}`")
+
     need_build = force_rebuild or (coll.count() or 0) == 0
     if need_build:
         with st.status("Building vector DB from PDFs…", expanded=True) as status:
-            count = build_vector_db(pdf_dir, db_path, coll_name, openai_embed_key)
+            count = build_vector_db(pdf_dir, db_path, coll_name, openai_embed_key, force_rebuild=force_rebuild)
             status.update(label=f"Vector DB ready with {count} chunks.", state="complete")
     else:
         st.caption(f"Vector DB OK — `{coll_name}` has {coll.count()} chunks.")
@@ -305,7 +370,7 @@ def run():
     # Short-term memory
     if "hw5_history" not in st.session_state:
         st.session_state.hw5_history = []  # list[(role, content)]
-    # Optional: cap to last N turns to keep prompts lean
+
     def trim_history(n=8):
         st.session_state.hw5_history = st.session_state.hw5_history[-n:]
 
@@ -315,7 +380,7 @@ def run():
             st.markdown(text)
 
     # Input
-    user_query = st.chat_input("Ask a course question (e.g., Which courses focus Python?)")
+    user_query = st.chat_input("Ask a course question (e.g., Which courses focus on Python?)")
     if not user_query:
         return
 
