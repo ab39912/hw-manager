@@ -1,11 +1,13 @@
-# HW5.py — RAG chatbot with short-term memory & multi-LLM switcher (OpenAI, Gemini, Claude)
+# HW5.py — RAG chatbot with short-term memory & multi-LLM switcher
+# Only shows "Needs API key" when a key is actually missing.
 
 # ── SQLite shim (Chroma needs sqlite>=3.35)
 try:
     import pysqlite3
     import sys as _sys
-    _sys.modules["sqlite3"] = _sys.modules.pop("pysqlite3")
+    _sys.modules["sqlite3"] = _sys_modules.pop("pysqlite3")  # type: ignore[name-defined]
 except Exception:
+    # Fallback if shim isn't available; Chroma may error later if sqlite is too old.
     pass
 
 import os, glob, textwrap
@@ -13,17 +15,17 @@ from typing import List, Tuple, Dict
 
 import streamlit as st
 
-# Optional SDKs (we’ll check availability at runtime)
+# Optional SDKs (loaded if installed)
 try:
-    from openai import OpenAI, BadRequestError  # OpenAI
+    from openai import OpenAI, BadRequestError  # OpenAI chat
 except Exception:
     OpenAI, BadRequestError = None, Exception
 try:
-    import google.generativeai as genai            # Gemini
+    import google.generativeai as genai          # Gemini
 except Exception:
     genai = None
 try:
-    import anthropic                               # Claude
+    import anthropic                             # Claude
 except Exception:
     anthropic = None
 
@@ -31,7 +33,7 @@ import chromadb
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from pypdf import PdfReader
 
-# ── App config
+# ── Defaults
 DEFAULT_PDF_DIR   = "lab4_pdfs"
 DEFAULT_DB_PATH   = ".chroma_hw5"
 DEFAULT_COLL_NAME = "HW5Collection"
@@ -51,9 +53,9 @@ SYSTEM_PROMPT = (
 GPT_MODELS = ["gpt-5-nano", "gpt-5-chat-latest"]
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 CLAUDE_MODELS = [
-    "claude-opus-4-1-20250805",   # Opus 4.1 (2025-08-05)
-    "claude-sonnet-4-20250514",   # Sonnet 4 (2025-05-14)
-    "claude-3-5-haiku-20241022",  # Haiku 3.5 (2024-10-22)
+    "claude-opus-4-1-20250805",
+    "claude-sonnet-4-20250514",
+    "claude-3-5-haiku-20241022",
 ]
 
 # ─────────────────────────────────────────
@@ -163,7 +165,7 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
             raise RuntimeError("openai SDK not installed.")
         api_key = st.secrets.get("OPENAI_API_KEY")
         if not api_key:
-            raise RuntimeError("Missing OPENAI_API_KEY in .streamlit/secrets.toml")
+            raise RuntimeError("OPENAI_API_KEY is missing.")
         client = OpenAI(api_key=api_key)
         resp = client.chat.completions.create(model=model, messages=messages)
         return resp.choices[0].message.content
@@ -173,7 +175,7 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
             raise RuntimeError("google-generativeai SDK not installed.")
         api_key = st.secrets.get("GEMINI_API_KEY")
         if not api_key:
-            raise RuntimeError("Missing GEMINI_API_KEY in .streamlit/secrets.toml")
+            raise RuntimeError("GEMINI_API_KEY is missing.")
         genai.configure(api_key=api_key)
 
         # Convert OpenAI-style messages to Gemini parts
@@ -188,7 +190,6 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
             else:
                 convo.append({"role": "model", "parts": [content]})
         if sys_prompt:
-            # Prepend system into the first user turn
             if convo and convo[0]["role"] == "user":
                 convo[0]["parts"] = [sys_prompt + convo[0]["parts"][0]]
             else:
@@ -196,7 +197,6 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
 
         model_obj = genai.GenerativeModel(model)
         resp = model_obj.generate_content(convo, safety_settings=None)
-        # Gemini SDK may stream; here we assume non-stream call
         return getattr(resp, "text", "").strip()
 
     elif provider == "Anthropic":
@@ -204,7 +204,7 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
             raise RuntimeError("anthropic SDK not installed.")
         api_key = st.secrets.get("ANTHROPIC_API_KEY")
         if not api_key:
-            raise RuntimeError("Missing ANTHROPIC_API_KEY in .streamlit/secrets.toml")
+            raise RuntimeError("ANTHROPIC_API_KEY is missing.")
         client = anthropic.Anthropic(api_key=api_key)
 
         # Split out system
@@ -216,7 +216,6 @@ def chat_with_model(provider: str, model: str, messages: list) -> str:
             elif m["role"] in ("user", "assistant"):
                 converted.append({"role": m["role"], "content": m["content"]})
         resp = client.messages.create(model=model, max_tokens=1024, system=system_text.strip(), messages=converted)
-        # Claude returns content as a list of blocks
         parts = resp.content or []
         for p in parts:
             if hasattr(p, "text"):
@@ -269,27 +268,33 @@ def run():
 
         if provider == "OpenAI":
             model = st.selectbox("Model", GPT_MODELS, index=0)
-            st.caption("Needs OPENAI_API_KEY")
+            if not st.secrets.get("OPENAI_API_KEY"):
+                st.warning("Needs OPENAI_API_KEY")
         elif provider == "Gemini":
             model = st.selectbox("Model", GEMINI_MODELS, index=0)
-            st.caption("Needs GEMINI_API_KEY")
+            if not st.secrets.get("GEMINI_API_KEY"):
+                st.warning("Needs GEMINI_API_KEY")
         else:
             model = st.selectbox("Model", CLAUDE_MODELS, index=1)
-            st.caption("Needs ANTHROPIC_API_KEY")
+            if not st.secrets.get("ANTHROPIC_API_KEY"):
+                st.warning("Needs ANTHROPIC_API_KEY")
 
+        # Show embeddings key warning only if missing
         st.divider()
-        if st.button("Diagnostics"):
-            try:
-                coll = _get_or_create_collection(db_path, coll_name, st.secrets.get("OPENAI_API_KEY", ""))
-                count = coll.count() or 0
-                st.info(f"Collection `{coll_name}` has {count} vectors.")
-            except Exception as e:
-                st.error(f"Collection error: {e}")
+        if not st.secrets.get("OPENAI_API_KEY"):
+            st.info("OpenAI embeddings are required for retrieval (set OPENAI_API_KEY).")
 
-    # Ensure embeddings key exists even if generation uses a different provider
+        with st.expander("🔐 Secrets status", expanded=False):
+            oai = bool(st.secrets.get("OPENAI_API_KEY"))
+            gmk = bool(st.secrets.get("GEMINI_API_KEY"))
+            ank = bool(st.secrets.get("ANTHROPIC_API_KEY"))
+            st.write("OPENAI_API_KEY:", oai)
+            st.write("GEMINI_API_KEY:", gmk)
+            st.write("ANTHROPIC_API_KEY:", ank)
+
+    # Ensure embeddings key exists for Chroma (we stop only if missing)
     openai_embed_key = st.secrets.get("OPENAI_API_KEY")
     if not openai_embed_key:
-        st.error("Embeddings require OPENAI_API_KEY in `.streamlit/secrets.toml` (used for Chroma).")
         st.stop()
 
     # Build / rebuild vector DB if needed
@@ -305,9 +310,6 @@ def run():
     # Short-term memory
     if "hw5_history" not in st.session_state:
         st.session_state.hw5_history = []  # list[(role, content)]
-    # Optional: cap to last N turns to keep prompts lean
-    def trim_history(n=8):
-        st.session_state.hw5_history = st.session_state.hw5_history[-n:]
 
     # Render prior turns
     for role, text in st.session_state.hw5_history:
@@ -336,6 +338,7 @@ def run():
         else:
             st.markdown("**No relevant course docs found** — answering generally.")
 
+        # Validate provider key only when that provider is selected
         try:
             answer = chat_with_model(provider, model, messages)
             st.markdown(answer or "_(Empty response)_")
@@ -343,9 +346,9 @@ def run():
             st.error(f"{provider} error: {e}")
             return
 
-    # Save and trim memory
+    # Save assistant reply (cap memory to last N turns)
     st.session_state.hw5_history.append(("assistant", answer))
-    trim_history(8)  # keep last 8 turns total
+    st.session_state.hw5_history = st.session_state.hw5_history[-8:]  # keep last 8 turns
 
 if __name__ == "__main__":
     run()
