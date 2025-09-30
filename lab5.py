@@ -48,7 +48,7 @@ SYSTEM_PROMPT = (
 )
 
 # ── Model registries
-GPT_MODELS = ["gpt-5-nano", "gpt-5-chat-latest"]
+GPT_MODELS = ["gpt-5-nano", "gpt-5-chat-latest","gpt-4o"],
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 CLAUDE_MODELS = [
     "claude-opus-4-1-20250805",   # Opus 4.1 (2025-08-05)
