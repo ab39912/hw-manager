@@ -1,4 +1,4 @@
-# streamlit_app.py  —  adapted for: company_name, days_since_2000, Date, Document, URL
+# streamlit_app.py — timezone-safe version for: company_name, days_since_2000, Date, Document, URL
 import math, re
 from datetime import datetime
 from typing import List
@@ -67,19 +67,24 @@ def normalize_from_example_csv(file) -> pd.DataFrame:
     out["title"] = pd.Series(title).fillna("Untitled")
     out["text"] = docs
 
+    # --- TIMEZONE-SAFE DATE PARSING ---
     if "Date" in df.columns:
-        out["date"] = pd.to_datetime(df["Date"], errors="coerce")
+        # Force parse as UTC (tz-aware), then drop tz to become tz-naive
+        out["date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True).dt.tz_convert(None)
     else:
         base = pd.Timestamp("2000-01-01")
         days = pd.to_numeric(df.get("days_since_2000", 0), errors="coerce").fillna(0).astype(int)
-        out["date"] = base + pd.to_timedelta(days, unit="D")
+        out["date"] = base + pd.to_timedelta(days, unit="D")  # already tz-naive
 
     out["source"] = df["company_name"].fillna("Unknown")
     out["url"] = df["URL"].fillna("")
     out["engagement"] = 0  # not provided; set to zero
 
     out = out.dropna(subset=["date"]).reset_index(drop=True)
-    out["age_days"] = (datetime.utcnow() - out["date"]).dt.days.clip(lower=0)
+
+    # Use a tz-naive "now" to match tz-naive dates
+    now_ts = pd.Timestamp.utcnow().tz_localize(None)
+    out["age_days"] = (now_ts - out["date"]).dt.days.clip(lower=0)
     out["doc"] = (out["title"].str.strip() + " || " + out["text"].str.strip()).str.lower()
     return out
 
@@ -124,7 +129,7 @@ def find_topic(df, index, W, legal_terms, query: str, k: int = 10, pool: int = 6
     pool_df = df.iloc[idxs].copy()
     pool_df["qsim"] = sims
     ranked = score_all(pool_df, index, W, legal_terms)
-    ranked["score"] = 0.85 * ranked["score"] + 0.15 * ranked["qsim"]  # small tie-breaker
+    ranked["score"] = 0.85 * ranked["score"] + 0.15 * pool_df["qsim"]  # small tie-breaker
     return ranked.sort_values("score", ascending=False).head(k)
 
 def make_context(block_df: pd.DataFrame, k: int = TOP_K_CONTEXT) -> str:
