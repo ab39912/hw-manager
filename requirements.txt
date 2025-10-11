@@ -13,4 +13,5 @@ pysqlite3-binary
 beautifulsoup4
 lxml
 scikit-learn>=1.3.0
-sentence-transformers>=2.2.2
+sentence-transformers==2.2.2
+torch>=2.3.0
