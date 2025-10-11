@@ -9,7 +9,8 @@ nav = st.navigation({
         st.Page(lab2.run, title="HW 2 ", url_path="lab-2"),
         st.Page(lab3.run, title="HW 3 ", url_path="lab-3"),
         st.Page(lab4.run, title="HW 4 ", url_path="lab-4"),
-        st.Page(lab5.run, title="HW 5 ", url_path="lab-5", default=True)
+        st.Page(lab5.run, title="HW 5 ", url_path="lab-5"),
+        st.Page(lab7.run, title="HW 7 ", url_path="lab-7", default=True)
     ]
 })
 
