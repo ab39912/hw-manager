@@ -1,5 +1,5 @@
 import streamlit as st
-import lab1, lab2, lab3, lab4, lab5
+import lab1, lab2, lab3, lab4, lab5, lab7
 
 st.set_page_config(page_title="Document QA", layout="wide")
 
