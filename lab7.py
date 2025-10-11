@@ -1,12 +1,23 @@
-# streamlit_app.py — timezone-safe version for: company_name, days_since_2000, Date, Document, URL
-import math, re
+# streamlit_app.py — RAG + ranking with real LLM calls (OpenAI / Claude)
+# CSV schema expected: company_name, days_since_2000, Date, Document, URL
+import math, re, os
 from datetime import datetime
-from typing import List
+from typing import List, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+
+# ---- LLM SDKs ----
+try:
+    from openai import OpenAI  # OpenAI official SDK (>=1.0)
+except Exception:
+    OpenAI = None
+try:
+    import anthropic  # Anthropic official SDK
+except Exception:
+    anthropic = None
 
 RECENCY_LAMBDA = 0.03  # ~30-day half-life
 TOP_K_CONTEXT = 6
@@ -17,6 +28,9 @@ DEFAULT_LEGAL_TERMS = [
     "patent","trademark","copyright","arbitration","class action","whistleblower",
     "FCPA","AML","export control","subpoena","injunction"
 ]
+
+OPENAI_MODELS = ["gpt-5-nano", "gpt-4o"]
+CLAUDE_MODELS = ["claude-opus-4-1-20250805", "claude-sonnet-4-20250514"]
 
 # ---------- Scoring helpers ----------
 def recency_score(age_days: float) -> float:
@@ -29,7 +43,6 @@ def engagement_score(x: float, max_eng: float) -> float:
 
 def legal_score(text: str, legal_terms) -> float:
     hits = sum(1 for t in legal_terms if re.search(r"\b" + re.escape(t) + r"\b", text, re.I))
-    # Saturating transform so 1–2 hits help but don't dominate
     return 1.0 - math.exp(-0.7 * hits)
 
 class TfIdfIndex:
@@ -67,23 +80,16 @@ def normalize_from_example_csv(file) -> pd.DataFrame:
     out["title"] = pd.Series(title).fillna("Untitled")
     out["text"] = docs
 
-    # --- TIMEZONE-SAFE DATE PARSING ---
-    if "Date" in df.columns:
-        # Force parse as UTC (tz-aware), then drop tz to become tz-naive
-        out["date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True).dt.tz_convert(None)
-    else:
-        base = pd.Timestamp("2000-01-01")
-        days = pd.to_numeric(df.get("days_since_2000", 0), errors="coerce").fillna(0).astype(int)
-        out["date"] = base + pd.to_timedelta(days, unit="D")  # already tz-naive
+    # Timezone-safe: parse as UTC then drop tz => tz-naive
+    out["date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True).dt.tz_convert(None)
 
     out["source"] = df["company_name"].fillna("Unknown")
     out["url"] = df["URL"].fillna("")
-    out["engagement"] = 0  # not provided; set to zero
+    out["engagement"] = 0  # not provided
 
     out = out.dropna(subset=["date"]).reset_index(drop=True)
 
-    # Use a tz-naive "now" to match tz-naive dates
-    now_ts = pd.Timestamp.utcnow().tz_localize(None)
+    now_ts = pd.Timestamp.utcnow().tz_localize(None)  # tz-naive to match 'date'
     out["age_days"] = (now_ts - out["date"]).dt.days.clip(lower=0)
     out["doc"] = (out["title"].str.strip() + " || " + out["text"].str.strip()).str.lower()
     return out
@@ -129,7 +135,7 @@ def find_topic(df, index, W, legal_terms, query: str, k: int = 10, pool: int = 6
     pool_df = df.iloc[idxs].copy()
     pool_df["qsim"] = sims
     ranked = score_all(pool_df, index, W, legal_terms)
-    ranked["score"] = 0.85 * ranked["score"] + 0.15 * pool_df["qsim"]  # small tie-breaker
+    ranked["score"] = 0.85 * ranked["score"] + 0.15 * pool_df["qsim"]
     return ranked.sort_values("score", ascending=False).head(k)
 
 def make_context(block_df: pd.DataFrame, k: int = TOP_K_CONTEXT) -> str:
@@ -142,53 +148,123 @@ def make_context(block_df: pd.DataFrame, k: int = TOP_K_CONTEXT) -> str:
         )
     return "\n".join(rows)
 
-def answer_with_stub_llm(prompt: str, vendor: str = "cheap") -> str:
-    """Stub so the app runs offline; swap with your real LLM calls."""
-    tail = "\n".join(prompt.splitlines()[-12:])
-    return f"(Vendor: {vendor})\n" + "—" * 22 + "\n" + tail
+# ---------- LLM calls ----------
+def openai_client():
+    if OpenAI is None:
+        raise RuntimeError("OpenAI SDK not installed. `pip install openai`")
+    api_key = st.secrets.get("OPENAI_API_KEY", None)
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not found in secrets.toml")
+    return OpenAI(api_key=api_key)
+
+def anthropic_client():
+    if anthropic is None:
+        raise RuntimeError("Anthropic SDK not installed. `pip install anthropic`")
+    api_key = st.secrets.get("ANTHROPIC_API_KEY", None)
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not found in secrets.toml")
+    return anthropic.Anthropic(api_key=api_key)
+
+def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: str, max_tokens: int = 800, temperature: float = 0.2) -> str:
+    """
+    Calls the selected LLM. Uses Chat Completions for OpenAI; Messages API for Anthropic.
+    """
+    if provider == "OpenAI":
+        client = openai_client()
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            return f"⚠️ OpenAI error for model '{model}': {e}"
+
+    elif provider == "Claude":
+        client = anthropic_client()
+        try:
+            resp = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=[{"role": "user", "content": f"{system_prompt}\n\n{user_prompt}"}],
+            )
+            # Concatenate text blocks
+            parts = []
+            for blk in resp.content:
+                if getattr(blk, "type", None) == "text":
+                    parts.append(blk.text)
+                elif isinstance(blk, dict) and blk.get("type") == "text":
+                    parts.append(blk.get("text", ""))
+            return "\n".join(parts).strip() or "(empty response)"
+        except Exception as e:
+            return f"⚠️ Claude error for model '{model}': {e}"
+    else:
+        return "⚠️ Unknown provider."
 
 # ---------- Streamlit app ----------
 def run():
     st.set_page_config(page_title="News Reporting Bot (Example CSV)", layout="wide")
-    st.title("📰 News Reporting Bot — adapted to Example_news_info_for_testing.csv")
+    st.title("📰 News Reporting Bot — OpenAI / Claude (with your secrets)")
 
     # Safe session defaults
-    if "vendor" not in st.session_state:
-        st.session_state.vendor = "cheap"
     if "weights" not in st.session_state:
         st.session_state.weights = {"recency": 0.35, "engagement": 0.15, "novelty": 0.25, "legal": 0.25}
     if "legal_terms" not in st.session_state:
         st.session_state.legal_terms = DEFAULT_LEGAL_TERMS.copy()
+    if "provider" not in st.session_state:
+        st.session_state.provider = "OpenAI"
+    if "model" not in st.session_state:
+        st.session_state.model = OPENAI_MODELS[0]
 
-    # Sidebar
+    # Sidebar (minimal)
     with st.sidebar:
         st.header("Upload CSV")
         up = st.file_uploader("Choose Example_news_info_for_testing.csv", type=["csv"])
         st.caption("Expected columns: company_name, days_since_2000, Date, Document, URL")
 
-        st.header("LLM vendor")
-        st.session_state.vendor = st.selectbox(
-            "Vendor", ["cheap", "expensive"],
-            index=["cheap", "expensive"].index(st.session_state.vendor)
-        )
+        st.header("LLM Provider & Model")
+        provider = st.radio("Provider", ["OpenAI", "Claude"], index=["OpenAI","Claude"].index(st.session_state.provider))
+        st.session_state.provider = provider
 
-        st.header("Weights (normalized)")
-        wR = st.slider("Recency", 0.0, 1.0, float(st.session_state.weights["recency"]), 0.05)
-        wE = st.slider("Engagement", 0.0, 1.0, float(st.session_state.weights["engagement"]), 0.05)
-        wN = st.slider("Novelty", 0.0, 1.0, float(st.session_state.weights["novelty"]), 0.05)
-        wL = st.slider("Legal", 0.0, 1.0, float(st.session_state.weights["legal"]), 0.05)
-        total = max(wR + wE + wN + wL, 1e-9)
-        st.session_state.weights = {
-            "recency": wR / total, "engagement": wE / total, "novelty": wN / total, "legal": wL / total
-        }
+        if provider == "OpenAI":
+            model = st.selectbox(
+                "Model", OPENAI_MODELS,
+                index=OPENAI_MODELS.index(st.session_state.model) if st.session_state.model in OPENAI_MODELS else 0
+            )
+        else:
+            model = st.selectbox(
+                "Model", CLAUDE_MODELS,
+                index=CLAUDE_MODELS.index(st.session_state.model) if st.session_state.model in CLAUDE_MODELS else 0
+            )
+        st.session_state.model = model
 
-        st.header("Legal keywords")
-        terms_txt = st.text_area("Comma-separated", ", ".join(st.session_state.legal_terms), height=120)
-        st.session_state.legal_terms = [t.strip() for t in terms_txt.split(",") if t.strip()]
+        # Advanced controls hidden by default
+        with st.expander("Advanced (weights, legal keywords, params)", expanded=False):
+            w = st.session_state.weights
+            wR = st.slider("Recency", 0.0, 1.0, float(w["recency"]), 0.05)
+            wE = st.slider("Engagement", 0.0, 1.0, float(w["engagement"]), 0.05)
+            wN = st.slider("Novelty", 0.0, 1.0, float(w["novelty"]), 0.05)
+            wL = st.slider("Legal", 0.0, 1.0, float(w["legal"]), 0.05)
+            total = max(wR + wE + wN + wL, 1e-9)
+            st.session_state.weights = {
+                "recency": wR / total, "engagement": wE / total, "novelty": wN / total, "legal": wL / total
+            }
 
-        st.header("Params")
-        k = st.slider("Top-k", 3, 15, 6)
-        pool = st.slider("Retriever pool (topic)", 20, 200, 60, step=10)
+            terms_txt = st.text_area("Legal keywords (comma-separated)", ", ".join(st.session_state.legal_terms), height=120)
+            st.session_state.legal_terms = [t.strip() for t in terms_txt.split(",") if t.strip()]
+
+            st.session_state.adv_k = st.slider("Top-k", 3, 15, 6, key="adv_k_slider")
+            st.session_state.adv_pool = st.slider("Retriever pool (topic)", 20, 200, 60, step=10, key="adv_pool_slider")
+
+    # Defaults if Advanced never opened
+    k = st.session_state.get("adv_k", st.session_state.get("adv_k_slider", 6))
+    pool = st.session_state.get("adv_pool", st.session_state.get("adv_pool_slider", 60))
 
     if up is None:
         st.info("Upload the CSV to activate the app.")
@@ -204,7 +280,6 @@ def run():
     @st.cache_resource(show_spinner=False)
     def build_index(docs: List[str]):
         return TfIdfIndex(docs)
-
     index = build_index(df["doc"].tolist())
 
     tabs = st.tabs(["⭐ Most interesting", "🔎 Topic search", "🧪 Debug"])
@@ -214,14 +289,14 @@ def run():
         if st.button("Rank now", type="primary"):
             ranked = find_most_interesting(df, index, st.session_state.weights, st.session_state.legal_terms, k=k)
             ctx = make_context(ranked, k=k)
-            prompt = f"""System: You are a precise news analyst for a global law firm.
-User: What are the most interesting recent items and why?
+            system = "You are a precise news analyst for a global law firm."
+            user = f"""Summarize the most interesting recent items and why.
+Use the context below; add legal significance and novelty. Cite items as [#]. 
 Context:
 {ctx}
 
-Instructions: Summarize key items (3–6 bullets). Explain legal significance and novelty.
-Cite like [#] and end with a short "Why this matters" paragraph."""
-            ans = answer_with_stub_llm(prompt, st.session_state.vendor)
+Output: 3–6 bullets + a short "Why this matters" paragraph."""
+            ans = answer_with_llm(st.session_state.provider, st.session_state.model, system, user)
             st.markdown("### Answer")
             st.write(ans)
             st.markdown("### Top-k ranked")
@@ -235,17 +310,14 @@ Cite like [#] and end with a short "Why this matters" paragraph."""
         st.subheader("Find news about…")
         q = st.text_input("Query (e.g., privacy AND FTC)", "privacy AND FTC")
         if st.button("Search & rank"):
-            ranked = find_topic(
-                df, index, st.session_state.weights, st.session_state.legal_terms, query=q, k=k, pool=pool
-            )
+            ranked = find_topic(df, index, st.session_state.weights, st.session_state.legal_terms, query=q, k=k, pool=pool)
             ctx = make_context(ranked, k=k)
-            prompt = f"""System: You are a precise news analyst for a global law firm.
-User intent: {q}
+            system = "You are a precise news analyst for a global law firm."
+            user = f"""User intent: {q}
+Use the context below to answer succinctly and cite items as [#]. Explain legal implications.
 Context:
-{ctx}
-
-Instructions: Provide a focused answer on the topic, cite [#], and explain legal implications."""
-            ans = answer_with_stub_llm(prompt, st.session_state.vendor)
+{ctx}"""
+            ans = answer_with_llm(st.session_state.provider, st.session_state.model, system, user)
             st.markdown("### Answer")
             st.write(ans)
             st.markdown("### Top-k ranked")
@@ -257,8 +329,10 @@ Instructions: Provide a focused answer on the topic, cite [#], and explain legal
 
     with tabs[2]:
         st.subheader("Debug")
+        st.write("Provider/Model:", st.session_state.provider, "/", st.session_state.model)
         st.write("Weights:", st.session_state.weights)
         st.write("Legal terms:", st.session_state.legal_terms)
+        st.write("k, pool:", k, pool)
         st.write("Dataset shape:", df.shape)
         st.dataframe(df.head(20), use_container_width=True)
 
