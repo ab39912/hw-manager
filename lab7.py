@@ -1,8 +1,8 @@
-# streamlit_app.py — RAG + ranking with real LLM calls (OpenAI / Claude)
-# CSV schema expected: company_name, days_since_2000, Date, Document, URL
-import math, re, os
-from datetime import datetime
-from typing import List, Tuple
+# streamlit_app.py — News Reporting Bot (OpenAI/Claude with secrets), CSV schema adapted
+# Expected CSV columns: company_name, days_since_2000, Date, Document, URL
+
+import math, re
+from typing import List
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -11,11 +11,11 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 # ---- LLM SDKs ----
 try:
-    from openai import OpenAI  # OpenAI official SDK (>=1.0)
+    from openai import OpenAI  # pip install openai>=1.0
 except Exception:
     OpenAI = None
 try:
-    import anthropic  # Anthropic official SDK
+    import anthropic          # pip install anthropic>=0.25
 except Exception:
     anthropic = None
 
@@ -32,6 +32,7 @@ DEFAULT_LEGAL_TERMS = [
 OPENAI_MODELS = ["gpt-5-nano", "gpt-4o"]
 CLAUDE_MODELS = ["claude-opus-4-1-20250805", "claude-sonnet-4-20250514"]
 
+
 # ---------- Scoring helpers ----------
 def recency_score(age_days: float) -> float:
     return float(np.exp(-RECENCY_LAMBDA * float(age_days)))
@@ -45,6 +46,7 @@ def legal_score(text: str, legal_terms) -> float:
     hits = sum(1 for t in legal_terms if re.search(r"\b" + re.escape(t) + r"\b", text, re.I))
     return 1.0 - math.exp(-0.7 * hits)
 
+
 class TfIdfIndex:
     def __init__(self, docs: List[str]):
         self.vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_df=0.95)
@@ -56,10 +58,11 @@ class TfIdfIndex:
         idx = sims.argsort()[::-1][:topn]
         return idx.tolist(), sims[idx].tolist()
 
+
 # ---------- CSV → internal schema ----------
 def normalize_from_example_csv(file) -> pd.DataFrame:
     """
-    Input columns (your CSV):
+    Input columns:
       - company_name, days_since_2000, Date, Document, URL
     Output (internal schema):
       id,title,text,date,source,url,engagement,age_days,doc
@@ -80,7 +83,7 @@ def normalize_from_example_csv(file) -> pd.DataFrame:
     out["title"] = pd.Series(title).fillna("Untitled")
     out["text"] = docs
 
-    # Timezone-safe: parse as UTC then drop tz => tz-naive
+    # Timezone-safe: parse as UTC and drop tz → tz-naive
     out["date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True).dt.tz_convert(None)
 
     out["source"] = df["company_name"].fillna("Unknown")
@@ -93,6 +96,7 @@ def normalize_from_example_csv(file) -> pd.DataFrame:
     out["age_days"] = (now_ts - out["date"]).dt.days.clip(lower=0)
     out["doc"] = (out["title"].str.strip() + " || " + out["text"].str.strip()).str.lower()
     return out
+
 
 # ---------- Novelty + ranking ----------
 def novelty_from_tfidf(index: TfIdfIndex, order_idx: List[int]) -> np.ndarray:
@@ -148,6 +152,7 @@ def make_context(block_df: pd.DataFrame, k: int = TOP_K_CONTEXT) -> str:
         )
     return "\n".join(rows)
 
+
 # ---------- LLM calls ----------
 def openai_client():
     if OpenAI is None:
@@ -165,22 +170,26 @@ def anthropic_client():
         raise RuntimeError("ANTHROPIC_API_KEY not found in secrets.toml")
     return anthropic.Anthropic(api_key=api_key)
 
-def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: str, max_tokens: int = 800, temperature: float = 0.2) -> str:
+def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: str,
+                    max_tokens: int = 800, temperature: float = 0.2) -> str:
     """
     Calls the selected LLM. Uses Chat Completions for OpenAI; Messages API for Anthropic.
+    NOTE: gpt-5-* models require 'max_completion_tokens' (not 'max_tokens').
     """
     if provider == "OpenAI":
         client = openai_client()
         try:
-            resp = client.chat.completions.create(
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                messages=[
+            token_param_key = "max_completion_tokens" if model.startswith("gpt-5-") else "max_tokens"
+            kwargs = {
+                "model": model,
+                "temperature": temperature,
+                token_param_key: max_tokens,
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-            )
+            }
+            resp = client.chat.completions.create(**kwargs)
             return resp.choices[0].message.content
         except Exception as e:
             return f"⚠️ OpenAI error for model '{model}': {e}"
@@ -194,9 +203,9 @@ def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: 
                 temperature=temperature,
                 messages=[{"role": "user", "content": f"{system_prompt}\n\n{user_prompt}"}],
             )
-            # Concatenate text blocks
             parts = []
-            for blk in resp.content:
+            # The SDK may return a list of blocks; gather text
+            for blk in getattr(resp, "content", []) or []:
                 if getattr(blk, "type", None) == "text":
                     parts.append(blk.text)
                 elif isinstance(blk, dict) and blk.get("type") == "text":
@@ -204,13 +213,14 @@ def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: 
             return "\n".join(parts).strip() or "(empty response)"
         except Exception as e:
             return f"⚠️ Claude error for model '{model}': {e}"
-    else:
-        return "⚠️ Unknown provider."
+
+    return "⚠️ Unknown provider."
+
 
 # ---------- Streamlit app ----------
 def run():
-    st.set_page_config(page_title="News Reporting Bot (Example CSV)", layout="wide")
-    st.title("📰 News Reporting Bot — OpenAI / Claude (with your secrets)")
+    st.set_page_config(page_title="News Reporting Bot", layout="wide")
+    st.title("📰 News Reporting Bot")
 
     # Safe session defaults
     if "weights" not in st.session_state:
@@ -259,6 +269,7 @@ def run():
             terms_txt = st.text_area("Legal keywords (comma-separated)", ", ".join(st.session_state.legal_terms), height=120)
             st.session_state.legal_terms = [t.strip() for t in terms_txt.split(",") if t.strip()]
 
+            # Store params (if user opens expander)
             st.session_state.adv_k = st.slider("Top-k", 3, 15, 6, key="adv_k_slider")
             st.session_state.adv_pool = st.slider("Retriever pool (topic)", 20, 200, 60, step=10, key="adv_pool_slider")
 
@@ -282,7 +293,7 @@ def run():
         return TfIdfIndex(docs)
     index = build_index(df["doc"].tolist())
 
-    tabs = st.tabs(["⭐ Most interesting", "🔎 Topic search", "🧪 Debug"])
+    tabs = st.tabs(["⭐ Most interesting", "🔎 Topic search"])
 
     with tabs[0]:
         st.subheader("Most interesting")
@@ -291,7 +302,7 @@ def run():
             ctx = make_context(ranked, k=k)
             system = "You are a precise news analyst for a global law firm."
             user = f"""Summarize the most interesting recent items and why.
-Use the context below; add legal significance and novelty. Cite items as [#]. 
+Use the context below; add legal significance and novelty. Cite items as [#].
 Context:
 {ctx}
 
@@ -302,9 +313,7 @@ Output: 3–6 bullets + a short "Why this matters" paragraph."""
             st.markdown("### Top-k ranked")
             show = ranked[["title","date","source","score","url","s_recency","s_engagement","s_novelty","s_legal"]]
             st.dataframe(show, use_container_width=True)
-            st.download_button(
-                "Download CSV", show.to_csv(index=False).encode("utf-8"), "most_interesting.csv", "text/csv"
-            )
+            # Download CSV intentionally removed per request
 
     with tabs[1]:
         st.subheader("Find news about…")
@@ -323,18 +332,10 @@ Context:
             st.markdown("### Top-k ranked")
             show = ranked[["title","date","source","score","url","s_recency","s_engagement","s_novelty","s_legal"]]
             st.dataframe(show, use_container_width=True)
+            # Keeping download here (not requested to remove). Comment out next 3 lines if you want it gone too.
             st.download_button(
                 "Download CSV", show.to_csv(index=False).encode("utf-8"), "topic_results.csv", "text/csv"
             )
-
-    with tabs[2]:
-        st.subheader("Debug")
-        st.write("Provider/Model:", st.session_state.provider, "/", st.session_state.model)
-        st.write("Weights:", st.session_state.weights)
-        st.write("Legal terms:", st.session_state.legal_terms)
-        st.write("k, pool:", k, pool)
-        st.write("Dataset shape:", df.shape)
-        st.dataframe(df.head(20), use_container_width=True)
 
 if __name__ == "__main__":
     run()
