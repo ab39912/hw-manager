@@ -1,380 +1,232 @@
-# lab7.py
-# HW 7 — CSV+PDF RAG bot with Chroma VectorDB + chunking
-# Provides a `run()` function for use with st.navigation, and a __main__ guard to run standalone.
-
-import os
-import io
-import re
-import json
-import math
-import datetime as dt
-from typing import List, Dict, Any, Tuple, Optional
-
-# ── SQLite shim (Chroma needs sqlite>=3.35; this helps on hosted envs)
-try:
-    import pysqlite3  # type: ignore
-    import sys as _sys
-    _sys.modules["sqlite3"] = _sys.modules.pop("pysqlite3")
-except Exception:
-    pass
-
-import streamlit as st
-import pandas as pd
+# streamlit_app.py
+import math, re
+from datetime import datetime
+from typing import List
 import numpy as np
-
-import chromadb
-from chromadb import PersistentClient
-from chromadb.api.models.Collection import Collection
-
-from sentence_transformers import SentenceTransformer
+import pandas as pd
+import streamlit as st
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from pypdf import PdfReader
 
-# Optional LLM summarization
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
 
-DB_DIR = ".chroma_news"
-COLLECTION_NAME = "news"
-EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
-DEFAULT_CHUNK_SIZE = 900
-DEFAULT_CHUNK_OVERLAP = 150
+# ---------- Helpers (pure functions) ----------
+RECENCY_LAMBDA = 0.03  # ~30-day half-life
+TOP_K_CONTEXT = 6
 
-LEGAL_KEYWORDS = [
-    "lawsuit","regulation","regulatory","compliance","antitrust","merger",
-    "acquisition","privacy","gdpr","ccpa","sec","doj","ftc","patent","ip",
-    "court","settlement","sanction","fine","subpoena","injunction","litigation",
-    "governance","esg","risk","data breach","cybersecurity","contract","arbitration"
+DEFAULT_LEGAL_TERMS = [
+    "antitrust","merger","acquisition","litigation","lawsuit","settlement",
+    "compliance","regulation","privacy","GDPR","CCPA","SEC","DOJ","sanction",
+    "patent","trademark","copyright","arbitration","class action","whistleblower",
+    "FCPA","AML","export control","subpoena","injunction"
 ]
 
-def _get_openai_client() -> Optional[Any]:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key or OpenAI is None:
-        return None
-    try:
-        return OpenAI(api_key=api_key)
-    except Exception:
-        return None
+def recency_score(age_days: float) -> float:
+    return float(np.exp(-RECENCY_LAMBDA * float(age_days)))
 
-@st.cache_resource(show_spinner=False)
-def _embedder() -> SentenceTransformer:
-    return SentenceTransformer(EMBED_MODEL_NAME)
+def engagement_score(x: float, max_eng: float) -> float:
+    if max_eng <= 0: return 0.0
+    return float(np.log1p(x)/np.log1p(max_eng))
 
-def _embed(texts: List[str]) -> np.ndarray:
-    vecs = _embedder().encode(texts, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
-    return vecs.astype(np.float32)
+def legal_score(text: str, legal_terms) -> float:
+    hits = sum(1 for t in legal_terms if re.search(rf"\b{re.escape(t)}\b", text, re.I))
+    # Saturating transform so one or two matches help but don't dominate
+    return 1.0 - math.exp(-0.7*hits)
 
-def _split_text(text: str, chunk_size: int, overlap: int) -> List[str]:
-    if not text:
-        return []
-    text = re.sub(r"\s+", " ", text).strip()
-    sents = re.split(r"(?<=[.!?])\s+", text)
-    chunks, buf = [], ""
-    for s in sents:
-        if len(buf) + len(s) + 1 <= chunk_size:
-            buf = s if not buf else buf + " " + s
+class TfIdfIndex:
+    def __init__(self, docs: List[str]):
+        self.vectorizer = TfidfVectorizer(ngram_range=(1,2), min_df=2, max_df=0.9)
+        self.mat = self.vectorizer.fit_transform(docs)
+
+    def query(self, q: str, topn: int = 50):
+        v = self.vectorizer.transform([q.lower()])
+        sims = cosine_similarity(v, self.mat).ravel()
+        idx = sims.argsort()[::-1][:topn]
+        return idx.tolist(), sims[idx].tolist()
+
+def load_news(file) -> pd.DataFrame:
+    df = pd.read_csv(file)
+    needed = ["id","title","text","date","source","url"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing column(s): {', '.join(missing)}")
+    df["text"] = df["text"].fillna("")
+    df["title"] = df["title"].fillna("")
+    if "engagement" not in df.columns:
+        df["engagement"] = 0
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).reset_index(drop=True)
+    df["age_days"] = (datetime.utcnow() - df["date"]).dt.days.clip(lower=0)
+    df["doc"] = (df["title"].str.strip() + " || " + df["text"].str.strip()).str.lower()
+    return df
+
+def novelty_from_tfidf(index: TfIdfIndex, order_idx: List[int]) -> np.ndarray:
+    """Greedy novelty = 1 - max cosine sim to any previously-seen (newer) doc."""
+    M = index.mat
+    novelty = np.ones(M.shape[0], dtype=float)
+    seen = []
+    for ridx in order_idx:
+        cand = M[ridx]
+        if not seen:
+            novelty[ridx] = 1.0
         else:
-            if buf:
-                chunks.append(buf.strip())
-            if chunks:
-                tail = chunks[-1][-overlap:]
-                buf = (tail + " " + s).strip()
-            else:
-                buf = s
-            if len(buf) > chunk_size * 2:
-                for i in range(0, len(buf), chunk_size - overlap):
-                    chunks.append(buf[i:i + chunk_size])
-                buf = ""
-    if buf:
-        chunks.append(buf.strip())
-    out = []
-    for c in chunks:
-        if len(c) <= chunk_size:
-            out.append(c)
-        else:
-            for i in range(0, len(c), chunk_size - overlap):
-                out.append(c[i:i + chunk_size])
-    return [c for c in out if c]
+            sims = cosine_similarity(cand, M[seen]).ravel()
+            novelty[ridx] = 1.0 - float(np.max(sims))
+        seen.append(ridx)
+    return novelty
 
-def _read_pdf_pages(file_bytes: bytes) -> List[Tuple[int, str]]:
-    reader = PdfReader(io.BytesIO(file_bytes))
-    pages = []
-    for i, p in enumerate(reader.pages):
-        try:
-            t = p.extract_text() or ""
-        except Exception:
-            t = ""
-        pages.append((i, t))
-    return pages
+def score_all(df: pd.DataFrame, index: TfIdfIndex, W: dict, legal_terms) -> pd.DataFrame:
+    max_eng = float(max(1.0, df["engagement"].max()))
+    df = df.copy()
+    df["s_recency"]    = df["age_days"].apply(recency_score)
+    df["s_engagement"] = df["engagement"].apply(lambda x: engagement_score(x, max_eng))
+    df["s_legal"]      = df["doc"].apply(lambda t: legal_score(t, legal_terms))
+    order = df.sort_values("date", ascending=False).index.tolist()
+    nov = novelty_from_tfidf(index, order_idx=order)
+    df["s_novelty"] = nov[df.index]
+    df["score"] = (W["recency"]*df["s_recency"] +
+                   W["engagement"]*df["s_engagement"] +
+                   W["novelty"]*df["s_novelty"] +
+                   W["legal"]*df["s_legal"])
+    return df.sort_values("score", ascending=False).reset_index(drop=True)
 
-def _infer_row_text(row: pd.Series) -> str:
-    preferred = ["title","headline","summary","description","content","body","text"]
-    bits = []
-    for c in preferred:
-        if c in row and isinstance(row[c], str) and row[c].strip():
-            bits.append(f"{c.capitalize()}: {row[c].strip()}")
-    if not bits:
-        for c, v in row.items():
-            if isinstance(v, str) and v.strip():
-                bits.append(f"{c}: {v.strip()}")
-    return " | ".join(bits)
+def find_most_interesting(df, index, W, legal_terms, k=10):
+    return score_all(df, index, W, legal_terms).head(k)
 
-def _parse_date(x: Any):
-    try:
-        if pd.isna(x):
-            return None
-        return pd.to_datetime(str(x)).date()
-    except Exception:
-        return None
+def find_topic(df, index, W, legal_terms, query: str, k=10, pool=60):
+    idxs, sims = index.query(query, topn=pool)
+    pool_df = df.iloc[idxs].copy()
+    pool_df["qsim"] = sims
+    ranked = score_all(pool_df, index, W, legal_terms)
+    ranked["score"] = 0.85*ranked["score"] + 0.15*ranked["qsim"]
+    return ranked.sort_values("score", ascending=False).head(k)
 
-@st.cache_resource(show_spinner=False)
-def _chroma() -> Tuple[PersistentClient, Collection]:
-    os.makedirs(DB_DIR, exist_ok=True)
-    client = chromadb.PersistentClient(path=DB_DIR)
-    try:
-        col = client.get_or_create_collection(COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
-    except Exception:
-        try:
-            client.delete_collection(COLLECTION_NAME)
-        except Exception:
-            pass
-        col = client.get_or_create_collection(COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
-    return client, col
+def make_context(block_df: pd.DataFrame, k: int = TOP_K_CONTEXT) -> str:
+    rows = []
+    for _, row in block_df.head(k).iterrows():
+        snippet = (row["text"][:320] + "…") if len(row["text"]) > 320 else row["text"]
+        rows.append(f"[{len(rows)+1}] {row['title']} "
+                    f"({row['date'].date()}, {row['source']}) — {snippet} <{row['url']}>")
+    return "\n".join(rows)
 
-def _reset_collection():
-    client, _ = _chroma()
-    try:
-        client.delete_collection(COLLECTION_NAME)
-    except Exception:
-        pass
-    client.get_or_create_collection(COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+def answer_with_stub_llm(prompt: str, vendor: str = "cheap") -> str:
+    """Placeholder for real LLM calls. Keeps the app fully local/offline."""
+    tail = "\n".join(prompt.splitlines()[-12:])
+    return f"(Vendor: {vendor})\n" + "—" * 22 + "\n" + tail
 
-def _add(col: Collection, records: List[Dict[str, Any]]):
-    if not records:
-        return
-    docs = [r["text"] for r in records]
-    ids  = [r["id"] for r in records]
-    metas= [r.get("metadata", {}) for r in records]
-    embs = _embed(docs)
-    col.add(documents=docs, ids=ids, embeddings=embs.tolist(), metadatas=metas)
 
-def _query(col: Collection, q: str, where: Optional[Dict[str, Any]] = None, k: int = 8) -> Dict[str, Any]:
-    q_emb = _embed([q])[0].tolist()
-    return col.query(query_embeddings=[q_emb], n_results=k, where=where or {})
-
-def _legal_kw_score(text: str) -> float:
-    t = text.lower()
-    c = sum(t.count(kw) for kw in LEGAL_KEYWORDS)
-    return 1.0 - math.exp(-c)
-
-def _recency_score(date_str: Any) -> float:
-    d = _parse_date(date_str)
-    if not d:
-        return 0.5
-    days = (dt.date.today() - d).days
-    return float(math.exp(-max(days, 0)/30.0))
-
-def _interest(sim: float, legal: float, rec: float) -> float:
-    return 0.60*sim + 0.25*rec + 0.15*legal
-
-def _rank_interest(col: Collection, k: int = 10):
-    probe = "Important legal, regulatory, or high-risk news relevant to global law firms and their clients"
-    res = _query(col, probe, k=max(k*4, 40))
-    docs  = res.get("documents", [[]])[0]
-    metas = res.get("metadatas", [[]])[0]
-    ids   = res.get("ids", [[]])[0]
-    probe_vec = _embed([probe])
-    cand_vecs = _embed(docs)
-    sims = cosine_similarity(probe_vec, cand_vecs)[0]
-    ranked = []
-    for doc, meta, _id, s in zip(docs, metas, ids, sims):
-        sc = _interest(float(s), _legal_kw_score(doc or ""), _recency_score(meta.get("date")))
-        ranked.append({"id": _id, "text": doc, "meta": meta, "score": sc})
-    ranked.sort(key=lambda x: x["score"], reverse=True)
-    return ranked[:k]
-
-def _meta_str(m: Dict[str, Any]) -> str:
-    parts = []
-    if m.get("title"): parts.append(f"**{str(m['title']).strip()}**")
-    if m.get("date"):  parts.append(f"Date: {str(m['date']).strip()}")
-    if m.get("source"):parts.append(f"Source: {str(m['source']).strip()}")
-    if m.get("doc_type"): parts.append(f"Type: {m['doc_type']}")
-    if m.get("page") is not None: parts.append(f"Page: {m['page']}")
-    if m.get("row_id") is not None: parts.append(f"Row: {m['row_id']}")
-    return " • ".join(parts)
-
-def _summarize(query: str, contexts: List[str]) -> str:
-    client = _get_openai_client()
-    if not client:
-        return "(No LLM set; showing extracted context)\n\n" + "\n\n".join(contexts)[:2000]
-    prompt = f"""You are a news assistant for a global law firm.
-Ground your answer ONLY in the provided context.
-
-Question: {query}
-
-Context:
-{chr(10).join('- '+c for c in contexts)}
-
-Answer:"""
-    try:
-        resp = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            messages=[{"role":"user","content":prompt}],
-            temperature=0.2,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        return f"(LLM error: {e}; falling back to extracted context)\n\n" + "\n\n".join(contexts)[:2000]
-
-def ingest_csv(col: Collection, df: pd.DataFrame, source_name: str):
-    recs = []
-    for idx, row in df.iterrows():
-        text = _infer_row_text(row)
-        if not text:
-            continue
-        meta = {"doc_type":"csv_row","source":source_name,"row_id":int(idx)}
-        for cand in ["date","published","pub_date","time","timestamp"]:
-            if cand in df.columns:
-                meta["date"] = str(row.get(cand))
-                break
-        for cand in ["title","headline"]:
-            if cand in df.columns:
-                meta["title"] = str(row.get(cand))
-                break
-        if "source" in df.columns:
-            meta["source"] = str(row.get("source"))
-        recs.append({"id": f"csv-{source_name}-{idx}", "text": text, "metadata": meta})
-    _add(col, recs)
-
-def ingest_pdf(col: Collection, file_bytes: bytes, filename: str, chunk_size: int, overlap: int):
-    recs = []
-    for pgi, ptext in _read_pdf_pages(file_bytes):
-        if not ptext.strip():
-            continue
-        for j, ch in enumerate(_split_text(ptext, chunk_size, overlap)):
-            recs.append({
-                "id": f"pdf-{filename}-{pgi}-{j}",
-                "text": ch,
-                "metadata": {"doc_type":"pdf","source":filename,"page":int(pgi),"title":filename}
-            })
-    _add(col, recs)
-
+# ---------- App ----------
 def run():
-    st.title("📰 HW 7 — CSV + PDF RAG (Chroma VectorDB)")
+    st.set_page_config(page_title="News Reporting Bot", layout="wide")
+    st.title("📰 News Reporting Bot (RAG-style retrieval + ranking)")
+
+    # --- safe session defaults ---
+    if "vendor" not in st.session_state:
+        st.session_state.vendor = "cheap"
+    if "weights" not in st.session_state:
+        st.session_state.weights = {"recency":0.35,"engagement":0.15,"novelty":0.25,"legal":0.25}
+    if "legal_terms" not in st.session_state:
+        st.session_state.legal_terms = DEFAULT_LEGAL_TERMS.copy()
+
+    # Sidebar controls
     with st.sidebar:
-        st.header("Ingest Data")
-        use_examples = st.toggle("Use example files if found", value=True)
-        csv_up = st.file_uploader("Upload news CSV", type=["csv"])
-        pdf_ups = st.file_uploader("Upload PDF(s)", type=["pdf"], accept_multiple_files=True)
+        st.header("1) Upload CSV")
+        up = st.file_uploader(
+            "Columns required: id,title,text,date,source,url  (optional: engagement)",
+            type=["csv"],
+        )
+        st.header("2) LLM vendor")
+        st.session_state.vendor = st.selectbox(
+            "Choose vendor (generation step)",
+            ["cheap", "expensive"],
+            index=["cheap","expensive"].index(st.session_state.vendor),
+        )
+        st.header("3) Weights (sum normalized to 1)")
+        wR = st.slider("Recency",    0.0, 1.0, float(st.session_state.weights["recency"]),    0.05)
+        wE = st.slider("Engagement", 0.0, 1.0, float(st.session_state.weights["engagement"]), 0.05)
+        wN = st.slider("Novelty",    0.0, 1.0, float(st.session_state.weights["novelty"]),    0.05)
+        wL = st.slider("Legal",      0.0, 1.0, float(st.session_state.weights["legal"]),      0.05)
+        total = max(wR + wE + wN + wL, 1e-9)
+        st.session_state.weights = {
+            "recency": wR/total, "engagement": wE/total, "novelty": wN/total, "legal": wL/total
+        }
 
-        st.subheader("Chunking")
-        ch_size = st.slider("Chunk size (chars)", 400, 1600, DEFAULT_CHUNK_SIZE, 50)
-        ch_overlap = st.slider("Chunk overlap (chars)", 50, 300, DEFAULT_CHUNK_OVERLAP, 10)
+        st.header("4) Legal keywords")
+        terms_txt = st.text_area("Comma-separated", ", ".join(st.session_state.legal_terms), height=120)
+        st.session_state.legal_terms = [t.strip() for t in terms_txt.split(",") if t.strip()]
 
-        st.subheader("Index")
-        _, col = _chroma()
-        if st.button("Reset index (danger)", type="secondary"):
-            _reset_collection()
-            st.success("Index reset.")
+        st.header("5) Parameters")
+        k    = st.slider("Top-k results", 3, 15, 6)
+        pool = st.slider("Retriever pool (topic)", 20, 200, 60, step=10)
 
-        if st.button("Build / Update Index", type="primary"):
-            with st.spinner("Indexing..."):
-                if use_examples:
-                    ex_csv = "/mnt/data/Example_news_info_for_testing.csv"
-                    ex_pdf = "/mnt/data/HW 7 (2).pdf"
-                    if os.path.exists(ex_csv):
-                        try:
-                            df = pd.read_csv(ex_csv)
-                            ingest_csv(col, df, source_name=os.path.basename(ex_csv))
-                            st.info(f"Ingested example CSV: {ex_csv}")
-                        except Exception as e:
-                            st.warning(f"Example CSV failed: {e}")
-                    if os.path.exists(ex_pdf):
-                        try:
-                            with open(ex_pdf, "rb") as f:
-                                ingest_pdf(col, f.read(), os.path.basename(ex_pdf), ch_size, ch_overlap)
-                            st.info(f"Ingested example PDF: {ex_pdf}")
-                        except Exception as e:
-                            st.warning(f"Example PDF failed: {e}")
+    st.info("Upload your CSV to activate the tabs. (Dates must be parseable, e.g., 2025-09-30.)")
 
-                if csv_up is not None:
-                    try:
-                        df = pd.read_csv(csv_up)
-                        ingest_csv(col, df, source_name=csv_up.name)
-                        st.success(f"Ingested CSV: {csv_up.name} (rows={len(df)})")
-                    except Exception as e:
-                        st.error(f"CSV ingest failed: {e}")
+    if up is None:
+        st.stop()
 
-                if pdf_ups:
-                    for pf in pdf_ups:
-                        try:
-                            ingest_pdf(col, pf.read(), pf.name, ch_size, ch_overlap)
-                            st.success(f"Ingested PDF: {pf.name}")
-                        except Exception as e:
-                            st.error(f"PDF ingest failed for {pf.name}: {e}")
+    # Load and index
+    try:
+        df = load_news(up)
+    except Exception as e:
+        st.error(f"Load error: {e}")
+        st.stop()
 
-    tab1, tab2, tab3 = st.tabs(["🔎 Ask", "⭐ Most Interesting", "🎯 Topic"])
-    _, col = _chroma()
+    @st.cache_resource(show_spinner=False)
+    def build_index(docs: List[str]):
+        return TfIdfIndex(docs)
+    index = build_index(df["doc"].tolist())
 
-    with tab1:
-        st.subheader("Ask a question")
-        q = st.text_input("Your question", value="What should a global law firm care about here?")
-        topk = st.slider("Top-K passages", 3, 15, 6, 1)
-        if st.button("Search & Answer", key="btn_qna"):
-            res = _query(col, q.strip(), k=topk)
-            docs  = res.get("documents",[[]])[0]
-            metas = res.get("metadatas",[[]])[0]
-            ids   = res.get("ids",[[]])[0]
-            if not docs:
-                st.info("No results yet. Build the index first.")
-            else:
-                for d, m, _ in zip(docs, metas, ids):
-                    with st.container(border=True):
-                        st.markdown(_meta_str(m))
-                        st.write(d)
-                st.markdown("#### Answer")
-                st.write(_summarize(q.strip(), docs))
+    tabs = st.tabs(["⭐ Most interesting", "🔎 Topic search", "🧪 Debug"])
 
-    with tab2:
-        st.subheader("Top 'Most Interesting' (law-firm lens)")
-        k = st.slider("How many items?", 3, 20, 10, 1)
-        if st.button("Rank now", key="btn_rank"):
-            ranked = _rank_interest(col, k=k)
-            for i, r in enumerate(ranked, start=1):
-                with st.container(border=True):
-                    st.markdown(f"### #{i} — score: {r['score']:.3f}")
-                    st.markdown(_meta_str(r["meta"]))
-                    st.write(r["text"])
+    with tabs[0]:
+        st.subheader("Most interesting")
+        if st.button("Rank now", type="primary"):
+            ranked = find_most_interesting(df, index, st.session_state.weights, st.session_state.legal_terms, k=k)
+            ctx = make_context(ranked, k=k)
+            prompt = f"""System: You are a precise news analyst for a global law firm.
+User: What are the most interesting recent items and why?
+Context:
+{ctx}
 
-    with tab3:
-        st.subheader("Find news about a specific topic")
-        topic = st.text_input("Topic (e.g., 'antitrust', 'privacy', 'mergers')", value="privacy")
-        where_filter = st.text_input("Optional JSON filter (Chroma 'where')", value="")
-        topk2 = st.slider("Top-K", 3, 20, 8, 1, key="topk2")
-        if st.button("Search by topic", key="btn_topic"):
-            where = {}
-            if where_filter.strip():
-                try:
-                    where = json.loads(where_filter)
-                except Exception as e:
-                    st.warning(f"Ignoring filter (bad JSON): {e}")
-            res = _query(col, topic.strip(), where=where, k=topk2)
-            docs  = res.get("documents",[[]])[0]
-            metas = res.get("metadatas",[[]])[0]
-            ids   = res.get("ids",[[]])[0]
-            if not docs:
-                st.info("No results yet. Build the index first.")
-            else:
-                for d, m, _ in zip(docs, metas, ids):
-                    with st.container(border=True):
-                        st.markdown(_meta_str(m))
-                        st.write(d)
-                st.markdown("#### Summary")
-                st.write(_summarize(f"Summarize topic: {topic}", docs))
+Instructions: Summarize key items (3–6 bullets). Explain legal significance and novelty.
+Cite like [#] and end with a short "Why this matters" paragraph."""
+            ans = answer_with_stub_llm(prompt, st.session_state.vendor)
+            st.markdown("### Answer")
+            st.write(ans)
+            st.markdown("### Top-k ranked")
+            show = ranked[["title","date","source","score","url","s_recency","s_engagement","s_novelty","s_legal"]]
+            st.dataframe(show, use_container_width=True)
+            st.download_button("Download CSV", show.to_csv(index=False).encode("utf-8"),
+                               "most_interesting.csv", "text/csv")
 
-# Allow running this page by itself (outside navigation)
+    with tabs[1]:
+        st.subheader("Find news about…")
+        q = st.text_input("Query (e.g., privacy AND FTC)", "privacy AND FTC")
+        if st.button("Search & rank"):
+            ranked = find_topic(df, index, st.session_state.weights, st.session_state.legal_terms,
+                                query=q, k=k, pool=pool)
+            ctx = make_context(ranked, k=k)
+            prompt = f"""System: You are a precise news analyst for a global law firm.
+User intent: {q}
+Context:
+{ctx}
+
+Instructions: Provide a focused answer on the topic, cite [#], and explain legal implications."""
+            ans = answer_with_stub_llm(prompt, st.session_state.vendor)
+            st.markdown("### Answer")
+            st.write(ans)
+            st.markdown("### Top-k ranked")
+            show = ranked[["title","date","source","score","url","s_recency","s_engagement","s_novelty","s_legal"]]
+            st.dataframe(show, use_container_width=True)
+            st.download_button("Download CSV", show.to_csv(index=False).encode("utf-8"),
+                               "topic_results.csv", "text/csv")
+
+    with tabs[2]:
+        st.subheader("Debug")
+        st.write("Weights:", st.session_state.weights)
+        st.write("Legal terms:", st.session_state.legal_terms)
+        st.write("Dataset shape:", df.shape)
+        st.dataframe(df.head(20), use_container_width=True)
+
+
 if __name__ == "__main__":
-    st.set_page_config(page_title="HW 7 — Document QA", layout="wide")
     run()
