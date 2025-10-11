@@ -174,21 +174,32 @@ def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: 
                     max_tokens: int = 800, temperature: float = 0.2) -> str:
     """
     Calls the selected LLM. Uses Chat Completions for OpenAI; Messages API for Anthropic.
-    NOTE: gpt-5-* models require 'max_completion_tokens' (not 'max_tokens').
+
+    OpenAI:
+      - gpt-5-* => uses max_completion_tokens and OMITS temperature (model requires default).
+      - others  => uses max_tokens and includes temperature.
+
+    Anthropic:
+      - uses max_tokens and temperature as usual.
     """
     if provider == "OpenAI":
         client = openai_client()
         try:
-            token_param_key = "max_completion_tokens" if model.startswith("gpt-5-") else "max_tokens"
+            is_gpt5 = model.startswith("gpt-5-")
             kwargs = {
                 "model": model,
-                "temperature": temperature,
-                token_param_key: max_tokens,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
             }
+            if is_gpt5:
+                kwargs["max_completion_tokens"] = max_tokens
+                # Do not pass temperature for gpt-5-* (only default allowed)
+            else:
+                kwargs["max_tokens"] = max_tokens
+                kwargs["temperature"] = temperature
+
             resp = client.chat.completions.create(**kwargs)
             return resp.choices[0].message.content
         except Exception as e:
@@ -204,7 +215,6 @@ def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: 
                 messages=[{"role": "user", "content": f"{system_prompt}\n\n{user_prompt}"}],
             )
             parts = []
-            # The SDK may return a list of blocks; gather text
             for blk in getattr(resp, "content", []) or []:
                 if getattr(blk, "type", None) == "text":
                     parts.append(blk.text)
@@ -313,7 +323,7 @@ Output: 3–6 bullets + a short "Why this matters" paragraph."""
             st.markdown("### Top-k ranked")
             show = ranked[["title","date","source","score","url","s_recency","s_engagement","s_novelty","s_legal"]]
             st.dataframe(show, use_container_width=True)
-            # Download CSV intentionally removed per request
+            # No download button (removed as requested)
 
     with tabs[1]:
         st.subheader("Find news about…")
@@ -332,10 +342,7 @@ Context:
             st.markdown("### Top-k ranked")
             show = ranked[["title","date","source","score","url","s_recency","s_engagement","s_novelty","s_legal"]]
             st.dataframe(show, use_container_width=True)
-            # Keeping download here (not requested to remove). Comment out next 3 lines if you want it gone too.
-            st.download_button(
-                "Download CSV", show.to_csv(index=False).encode("utf-8"), "topic_results.csv", "text/csv"
-            )
+            # No download button here either (removed)
 
 if __name__ == "__main__":
     run()
