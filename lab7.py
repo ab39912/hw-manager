@@ -19,6 +19,38 @@ try:
 except Exception:
     anthropic = None
 
+# ---- Gemini safety enums (with fallback to strings) ----
+try:
+    from google.generativeai.types import HarmCategory, HarmBlockThreshold
+    _HAS_ENUMS = True
+except Exception:
+    HarmCategory = HarmBlockThreshold = None
+    _HAS_ENUMS = False
+
+def build_safety_settings(relaxed: bool):
+    """
+    Return safety_settings compatible with both new (enum) and older (string) SDKs.
+    relaxed=False -> None (use model defaults).
+    """
+    if not relaxed:
+        return None
+    if _HAS_ENUMS:
+        return [
+            {"category": HarmCategory.HARASSMENT,         "threshold": HarmBlockThreshold.BLOCK_ONLY_HIGH},
+            {"category": HarmCategory.HATE_SPEECH,        "threshold": HarmBlockThreshold.BLOCK_ONLY_HIGH},
+            {"category": HarmCategory.DANGEROUS_CONTENT,  "threshold": HarmBlockThreshold.BLOCK_ONLY_HIGH},
+            {"category": HarmCategory.SEXUAL_CONTENT,     "threshold": HarmBlockThreshold.BLOCK_ONLY_HIGH},
+        ]
+    else:
+        # Older SDKs accept these string constants (UPPER-CASE)
+        return [
+            {"category": "HARM_CATEGORY_HARASSMENT",         "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH",        "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",  "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_SEXUAL_CONTENT",     "threshold": "BLOCK_ONLY_HIGH"},
+        ]
+
+
 RECENCY_LAMBDA = 0.03  # ~30-day half-life
 TOP_K_CONTEXT = 6
 
@@ -31,14 +63,6 @@ DEFAULT_LEGAL_TERMS = [
 
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
 CLAUDE_MODELS = ["claude-opus-4-1-20250805", "claude-sonnet-4-20250514"]
-
-# --- Optional relaxed safety for Gemini (reduces false positives) ---
-SAFETY_RELAXED = [
-    {"category": "HARM_CATEGORY_HARASSMENT",       "threshold": "BLOCK_ONLY_HIGH"},
-    {"category": "HARM_CATEGORY_HATE_SPEECH",      "threshold": "BLOCK_ONLY_HIGH"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT","threshold": "BLOCK_ONLY_HIGH"},
-    {"category": "HARM_CATEGORY_SEXUAL_CONTENT",   "threshold": "BLOCK_ONLY_HIGH"},
-]
 
 
 # ---------- Scoring helpers ----------
@@ -69,6 +93,12 @@ class TfIdfIndex:
 
 # ---------- CSV → internal schema ----------
 def normalize_from_example_csv(file) -> pd.DataFrame:
+    """
+    Input columns:
+      - company_name, days_since_2000, Date, Document, URL
+    Output (internal schema):
+      id,title,text,date,source,url,engagement,age_days,doc
+    """
     df = pd.read_csv(file)
     need = ["company_name", "Date", "Document", "URL"]
     miss = [c for c in need if c not in df.columns]
@@ -84,14 +114,17 @@ def normalize_from_example_csv(file) -> pd.DataFrame:
 
     out["title"] = pd.Series(title).fillna("Untitled")
     out["text"] = docs
+
+    # Timezone-safe: parse as UTC and drop tz → tz-naive
     out["date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True).dt.tz_convert(None)
+
     out["source"] = df["company_name"].fillna("Unknown")
     out["url"] = df["URL"].fillna("")
-    out["engagement"] = 0
+    out["engagement"] = 0  # not provided
 
     out = out.dropna(subset=["date"]).reset_index(drop=True)
 
-    now_ts = pd.Timestamp.utcnow().tz_localize(None)
+    now_ts = pd.Timestamp.utcnow().tz_localize(None)  # tz-naive to match 'date'
     out["age_days"] = (now_ts - out["date"]).dt.days.clip(lower=0)
     out["doc"] = (out["title"].str.strip() + " || " + out["text"].str.strip()).str.lower()
     return out
@@ -99,6 +132,7 @@ def normalize_from_example_csv(file) -> pd.DataFrame:
 
 # ---------- Novelty + ranking ----------
 def novelty_from_tfidf(index: TfIdfIndex, order_idx: List[int]) -> np.ndarray:
+    """Greedy novelty = 1 - max cosine similarity to any previously-seen (newer) doc."""
     M = index.mat
     novelty = np.ones(M.shape[0], dtype=float)
     seen = []
@@ -155,7 +189,10 @@ def make_context(block_df: pd.DataFrame, k: int = TOP_K_CONTEXT) -> str:
 def gemini_client():
     if genai is None:
         raise RuntimeError("Gemini SDK not installed. `pip install google-generativeai`")
-    api_key = st.secrets.get("GOOGLE_API_KEY") or st.secrets.get("GEMINI_API_KEY")
+    api_key = (
+        st.secrets.get("GOOGLE_API_KEY")
+        or st.secrets.get("GEMINI_API_KEY")
+    )
     if not api_key:
         raise RuntimeError("GOOGLE_API_KEY (or GEMINI_API_KEY) not found in secrets.toml")
     genai.configure(api_key=api_key)
@@ -215,7 +252,7 @@ def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: 
     """
     Gemini:
       - GenerativeModel with system_instruction.
-      - generate_content with explicit contents + optional relaxed safety.
+      - generate_content with explicit contents + optional relaxed safety (enums or strings).
       - Robust extraction + fallback (shorter prompt, then flash).
     Anthropic:
       - Messages API.
@@ -226,7 +263,7 @@ def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: 
             model_obj = client.GenerativeModel(model_name=model, system_instruction=system_prompt)
 
             contents = [{"role": "user", "parts": [_neutralize_prompt(user_prompt)]}]
-            safety_settings = SAFETY_RELAXED if safety_relaxed else None
+            safety_settings = build_safety_settings(safety_relaxed)
 
             resp = model_obj.generate_content(
                 contents,
@@ -323,7 +360,7 @@ def run():
     st.title("📰 News Reporting Bot")
 
     # one-time migration to clear stale state
-    APP_VERSION = "2025-10-14-gemini-relaxed"
+    APP_VERSION = "2025-10-14-gemini-enum-safety"
     if st.session_state.get("_app_version") != APP_VERSION:
         for k in ["provider", "model", "weights", "legal_terms", "adv_k", "adv_pool",
                   "adv_k_slider", "adv_pool_slider", "safety_relaxed"]:
@@ -346,6 +383,7 @@ def run():
         st.session_state.safety_relaxed = False
 
     with st.sidebar:
+        # Reset button for quick full refresh
         if st.button("🔄 Reset app & clear cache"):
             try: st.cache_data.clear()
             except Exception: pass
@@ -393,8 +431,11 @@ def run():
             st.session_state.adv_k = st.slider("Top-k", 3, 15, 6, key="adv_k_slider")
             st.session_state.adv_pool = st.slider("Retriever pool (topic)", 20, 200, 60, step=10, key="adv_pool_slider")
 
-            st.session_state.safety_relaxed = st.checkbox("Use relaxed safety (BLOCK_ONLY_HIGH)", value=st.session_state.safety_relaxed,
-                                                          help="Reduces false safety blocks while keeping protections.")
+            st.session_state.safety_relaxed = st.checkbox(
+                "Use relaxed safety (BLOCK_ONLY_HIGH)",
+                value=st.session_state.safety_relaxed,
+                help="Reduces false safety blocks while keeping protections."
+            )
 
     k = st.session_state.get("adv_k", st.session_state.get("adv_k_slider", 6))
     pool = st.session_state.get("adv_pool", st.session_state.get("adv_pool_slider", 60))
