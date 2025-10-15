@@ -29,7 +29,7 @@ DEFAULT_LEGAL_TERMS = [
     "FCPA","AML","export control","subpoena","injunction"
 ]
 
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
+GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-pro"]
 CLAUDE_MODELS = ["claude-opus-4-1-20250805", "claude-sonnet-4-20250514"]
 
 
