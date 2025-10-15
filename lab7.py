@@ -1,4 +1,4 @@
-# streamlit_app.py — News Reporting Bot (OpenAI/Claude with secrets), CSV schema adapted
+# streamlit_app.py — News Reporting Bot (Gemini/Claude with secrets), CSV schema adapted
 # Expected CSV columns: company_name, days_since_2000, Date, Document, URL
 
 import math, re
@@ -11,11 +11,11 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 # ---- LLM SDKs ----
 try:
-    from openai import OpenAI  # pip install openai>=1.0
+    import google.generativeai as genai   # pip install google-generativeai>=0.7
 except Exception:
-    OpenAI = None
+    genai = None
 try:
-    import anthropic          # pip install anthropic>=0.25
+    import anthropic                      # pip install anthropic>=0.25
 except Exception:
     anthropic = None
 
@@ -29,7 +29,7 @@ DEFAULT_LEGAL_TERMS = [
     "FCPA","AML","export control","subpoena","injunction"
 ]
 
-OPENAI_MODELS = ["gpt-5-nano", "gpt-4o"]
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
 CLAUDE_MODELS = ["claude-opus-4-1-20250805", "claude-sonnet-4-20250514"]
 
 
@@ -153,14 +153,18 @@ def make_context(block_df: pd.DataFrame, k: int = TOP_K_CONTEXT) -> str:
     return "\n".join(rows)
 
 
-# ---------- LLM calls ----------
-def openai_client():
-    if OpenAI is None:
-        raise RuntimeError("OpenAI SDK not installed. `pip install openai`")
-    api_key = st.secrets.get("OPENAI_API_KEY", None)
+# ---------- LLM clients ----------
+def gemini_client():
+    if genai is None:
+        raise RuntimeError("Gemini SDK not installed. `pip install google-generativeai`")
+    api_key = (
+        st.secrets.get("GOOGLE_API_KEY")
+        or st.secrets.get("GEMINI_API_KEY")
+    )
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY not found in secrets.toml")
-    return OpenAI(api_key=api_key)
+        raise RuntimeError("GOOGLE_API_KEY (or GEMINI_API_KEY) not found in secrets.toml")
+    genai.configure(api_key=api_key)
+    return genai
 
 def anthropic_client():
     if anthropic is None:
@@ -170,40 +174,33 @@ def anthropic_client():
         raise RuntimeError("ANTHROPIC_API_KEY not found in secrets.toml")
     return anthropic.Anthropic(api_key=api_key)
 
+
+# ---------- LLM calls ----------
 def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: str,
                     max_tokens: int = 800, temperature: float = 0.2) -> str:
     """
-    Calls the selected LLM. Uses Chat Completions for OpenAI; Messages API for Anthropic.
+    Calls the selected LLM.
 
-    OpenAI:
-      - gpt-5-* => uses max_completion_tokens and OMITS temperature (model requires default).
-      - others  => uses max_tokens and includes temperature.
+    Gemini:
+      - Uses google-generativeai. We construct a GenerativeModel with system_instruction,
+        then call generate_content on the user prompt.
+      - generation_config: max_output_tokens, temperature.
 
     Anthropic:
-      - uses max_tokens and temperature as usual.
+      - Uses Messages API (max_tokens, temperature).
     """
-    if provider == "OpenAI":
-        client = openai_client()
+    if provider == "Gemini":
+        client = gemini_client()
         try:
-            is_gpt5 = model.startswith("gpt-5-")
-            kwargs = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            }
-            if is_gpt5:
-                kwargs["max_completion_tokens"] = max_tokens
-                # Do not pass temperature for gpt-5-* (only default allowed)
-            else:
-                kwargs["max_tokens"] = max_tokens
-                kwargs["temperature"] = temperature
-
-            resp = client.chat.completions.create(**kwargs)
-            return resp.choices[0].message.content
+            model_obj = client.GenerativeModel(model_name=model, system_instruction=system_prompt)
+            resp = model_obj.generate_content(
+                [user_prompt],
+                generation_config={"max_output_tokens": max_tokens, "temperature": temperature},
+            )
+            # google-generativeai returns .text for the primary text response
+            return (getattr(resp, "text", None) or "").strip() or "(empty response)"
         except Exception as e:
-            return f"⚠️ OpenAI error for model '{model}': {e}"
+            return f"⚠️ Gemini error for model '{model}': {e}"
 
     elif provider == "Claude":
         client = anthropic_client()
@@ -238,9 +235,9 @@ def run():
     if "legal_terms" not in st.session_state:
         st.session_state.legal_terms = DEFAULT_LEGAL_TERMS.copy()
     if "provider" not in st.session_state:
-        st.session_state.provider = "OpenAI"
+        st.session_state.provider = "Gemini"
     if "model" not in st.session_state:
-        st.session_state.model = OPENAI_MODELS[0]
+        st.session_state.model = GEMINI_MODELS[0]
 
     # Sidebar (minimal)
     with st.sidebar:
@@ -249,13 +246,13 @@ def run():
         st.caption("Expected columns: company_name, days_since_2000, Date, Document, URL")
 
         st.header("LLM Provider & Model")
-        provider = st.radio("Provider", ["OpenAI", "Claude"], index=["OpenAI","Claude"].index(st.session_state.provider))
+        provider = st.radio("Provider", ["Gemini", "Claude"], index=["Gemini","Claude"].index(st.session_state.provider))
         st.session_state.provider = provider
 
-        if provider == "OpenAI":
+        if provider == "Gemini":
             model = st.selectbox(
-                "Model", OPENAI_MODELS,
-                index=OPENAI_MODELS.index(st.session_state.model) if st.session_state.model in OPENAI_MODELS else 0
+                "Model", GEMINI_MODELS,
+                index=GEMINI_MODELS.index(st.session_state.model) if st.session_state.model in GEMINI_MODELS else 0
             )
         else:
             model = st.selectbox(
