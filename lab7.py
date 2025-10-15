@@ -11,11 +11,11 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 # ---- LLM SDKs ----
 try:
-    import google.generativeai as genai   # pip install google-generativeai>=0.7
+    import google.generativeai as genai   # pip install -U google-generativeai>=0.7
 except Exception:
     genai = None
 try:
-    import anthropic                      # pip install anthropic>=0.25
+    import anthropic                      # pip install -U anthropic>=0.25
 except Exception:
     anthropic = None
 
@@ -29,7 +29,7 @@ DEFAULT_LEGAL_TERMS = [
     "FCPA","AML","export control","subpoena","injunction"
 ]
 
-GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-pro"]
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
 CLAUDE_MODELS = ["claude-opus-4-1-20250805", "claude-sonnet-4-20250514"]
 
 
@@ -175,6 +175,45 @@ def anthropic_client():
     return anthropic.Anthropic(api_key=api_key)
 
 
+# ---------- Gemini robust extraction helper ----------
+def _gemini_extract_text(resp):
+    """
+    Robustly extract text from a google-generativeai response.
+    Returns (text, finish_reason, safety) where `text` may be "".
+    """
+    # Try quick accessor first
+    try:
+        txt = (getattr(resp, "text", None) or "").strip()
+    except Exception:
+        txt = ""
+
+    finish_reason = None
+    safety = None
+
+    try:
+        cands = getattr(resp, "candidates", []) or []
+        if cands:
+            cand0 = cands[0]
+            finish_reason = getattr(cand0, "finish_reason", None) or getattr(cand0, "finishReason", None)
+            safety = getattr(cand0, "safety_ratings", None) or getattr(cand0, "safetyRatings", None)
+
+            if not txt:
+                parts = []
+                content = getattr(cand0, "content", None)
+                if content and getattr(content, "parts", None):
+                    for p in content.parts:
+                        t = getattr(p, "text", None)
+                        if t:
+                            parts.append(t)
+                        elif isinstance(p, dict) and "text" in p:
+                            parts.append(p["text"])
+                txt = "\n".join(parts).strip()
+    except Exception:
+        pass
+
+    return txt, finish_reason, safety
+
+
 # ---------- LLM calls ----------
 def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: str,
                     max_tokens: int = 800, temperature: float = 0.2) -> str:
@@ -182,23 +221,86 @@ def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: 
     Calls the selected LLM.
 
     Gemini:
-      - Uses google-generativeai. We construct a GenerativeModel with system_instruction,
-        then call generate_content on the user prompt.
-      - generation_config: max_output_tokens, temperature.
+      - Construct GenerativeModel with system_instruction.
+      - generate_content with explicit contents payload.
+      - Robust extraction + fallback on empty text (safety/max_tokens).
 
     Anthropic:
-      - Uses Messages API (max_tokens, temperature).
+      - Messages API (max_tokens, temperature).
     """
     if provider == "Gemini":
         client = gemini_client()
         try:
-            model_obj = client.GenerativeModel(model_name=model, system_instruction=system_prompt)
-            resp = model_obj.generate_content(
-                [user_prompt],
-                generation_config={"max_output_tokens": max_tokens, "temperature": temperature},
+            model_obj = client.GenerativeModel(
+                model_name=model,
+                system_instruction=system_prompt
             )
-            # google-generativeai returns .text for the primary text response
-            return (getattr(resp, "text", None) or "").strip() or "(empty response)"
+
+            contents = [{"role": "user", "parts": [user_prompt]}]
+
+            resp = model_obj.generate_content(
+                contents,
+                generation_config={
+                    "max_output_tokens": max_tokens,
+                    "temperature": temperature,
+                    "candidate_count": 1,
+                },
+            )
+
+            text, finish_reason, _safety = _gemini_extract_text(resp)
+
+            # If empty, try a gentler, shorter fallback
+            if not text:
+                fallback_prompt = (
+                    user_prompt
+                    + "\n\nPlease summarize in 4–6 concise bullet points with brief legal implications."
+                )
+                resp2 = model_obj.generate_content(
+                    [{"role": "user", "parts": [fallback_prompt]}],
+                    generation_config={
+                        "max_output_tokens": min(512, max_tokens),
+                        "temperature": 0.2,
+                        "candidate_count": 1,
+                    },
+                )
+                text2, finish_reason2, _safety2 = _gemini_extract_text(resp2)
+                if text2:
+                    return text2
+
+                # Final fallback: switch to 2.5-flash
+                try:
+                    if model != "gemini-2.5-flash":
+                        model_obj_flash = client.GenerativeModel(
+                            model_name="gemini-2.5-flash",
+                            system_instruction=system_prompt
+                        )
+                        resp3 = model_obj_flash.generate_content(
+                            [{"role": "user", "parts": [fallback_prompt]}],
+                            generation_config={
+                                "max_output_tokens": min(512, max_tokens),
+                                "temperature": 0.2,
+                                "candidate_count": 1,
+                            },
+                        )
+                        text3, finish_reason3, _safety3 = _gemini_extract_text(resp3)
+                        if text3:
+                            return text3
+                        finish_reason = finish_reason3 or finish_reason
+                except Exception:
+                    pass
+
+                return (
+                    f"⚠️ Gemini returned no text (finish_reason={finish_reason}). "
+                    f"This can happen due to safety or token limits. "
+                    f"Try a more neutral phrasing or use 'gemini-2.5-flash'."
+                )
+
+            # Normal successful path
+            if finish_reason and str(finish_reason).upper() not in ("STOP", "FINISH_REASON_STOP"):
+                return text + f"\n\n_(Note: model finish_reason={finish_reason})_"
+
+            return text
+
         except Exception as e:
             return f"⚠️ Gemini error for model '{model}': {e}"
 
@@ -226,8 +328,20 @@ def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: 
 
 # ---------- Streamlit app ----------
 def run():
-    st.set_page_config(page_title="HW-7 News Reporting Bot", layout="wide")
+    st.set_page_config(page_title="News Reporting Bot", layout="wide")
     st.title("📰 News Reporting Bot")
+
+    # ---- one-time migration to clear stale state when code changes ----
+    APP_VERSION = "2025-10-14-gemini-fix"
+    if st.session_state.get("_app_version") != APP_VERSION:
+        for k in ["provider", "model", "weights", "legal_terms", "adv_k", "adv_pool", "adv_k_slider", "adv_pool_slider"]:
+            st.session_state.pop(k, None)
+        st.session_state["_app_version"] = APP_VERSION
+
+    # Guard for any legacy/invalid provider values
+    valid_providers = {"Gemini", "Claude"}
+    if st.session_state.get("provider") not in valid_providers:
+        st.session_state.provider = "Gemini"
 
     # Safe session defaults
     if "weights" not in st.session_state:
@@ -241,6 +355,23 @@ def run():
 
     # Sidebar (minimal)
     with st.sidebar:
+        # Reset button for quick full refresh
+        if st.button("🔄 Reset app & clear cache"):
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            try:
+                st.cache_resource.clear()
+            except Exception:
+                pass
+            st.session_state.clear()
+            try:
+                st.rerun()  # Streamlit >= 1.30
+            except Exception:
+                st.experimental_rerun()
+        st.markdown("---")
+
         st.header("Upload CSV")
         up = st.file_uploader("Choose Example_news_info_for_testing.csv", type=["csv"])
         st.caption("Expected columns: company_name, days_since_2000, Date, Document, URL")
@@ -320,7 +451,6 @@ Output: 3–6 bullets + a short "Why this matters" paragraph."""
             st.markdown("### Top-k ranked")
             show = ranked[["title","date","source","score","url","s_recency","s_engagement","s_novelty","s_legal"]]
             st.dataframe(show, use_container_width=True)
-            # No download button (removed as requested)
 
     with tabs[1]:
         st.subheader("Find news about…")
@@ -339,7 +469,7 @@ Context:
             st.markdown("### Top-k ranked")
             show = ranked[["title","date","source","score","url","s_recency","s_engagement","s_novelty","s_legal"]]
             st.dataframe(show, use_container_width=True)
-            # No download button here either (removed)
+
 
 if __name__ == "__main__":
     run()
