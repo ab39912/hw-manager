@@ -34,15 +34,15 @@ import chromadb  # after shim
 # ==============================================================================
 # 1) Constants & Model Options
 # ==============================================================================
-PAGE_TITLE = "HW7: News Information Bot"
-PAGE_ICON = "🗞️"
+PAGE_TITLE = "HW7: News Bot"
+
 
 CHROMA_DB_PATH = "./ChromaDB_RAG"
 CHROMA_COLLECTION_NAME = "HW7_NewsCollection"
 DEFAULT_CSV_PATH = "hw7pdfs/Example_news_info_for_testing.csv"
 
 MODEL_OPTIONS = {
-    "OpenAI": ["gpt-5-nano", "gpt-5-mini", "gpt-5-chat-latest"],
+    "OpenAI": ["gpt-5-nano", "gpt-5-chat-latest"],
     "Google": ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"],
     "Anthropic": ["claude-3-haiku-20240307", "claude-3-5-sonnet-20240620", "claude-sonnet-4-20250514"],
 }
