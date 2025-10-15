@@ -2,15 +2,14 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # HW7: News Information Bot (Streamlit + Multi-Vendor + ChromaDB + CSV RAG)
 # Ranks "most interesting" news for a global law firm and answers questions.
-# Expects CSV with columns: title, summary, content, published_date, source, url
-# If columns differ, the app will adapt best-effort.
+# Expected CSV columns (best-effort adaptable):
+#   title, summary, content, published_date, source, url
 # ──────────────────────────────────────────────────────────────────────────────
 
 import os
 import sys
 import re
-import math
-import datetime as dt
+from io import BytesIO
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -20,9 +19,6 @@ from openai import OpenAI
 import google.generativeai as genai
 from anthropic import Anthropic
 
-# HTML parsing is not required here, but kept for parity with HW5 patterns
-# from bs4 import BeautifulSoup
-
 # ==============================================================================
 # 0) SQLite shim (for older Linux images in Streamlit Cloud)
 # ==============================================================================
@@ -30,9 +26,10 @@ try:
     __import__("pysqlite3")
     sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 except Exception:
-    print("⚠️  Falling back to system sqlite3 (may be outdated).")
-import chromadb
-from langchain.text_splitter import RecursiveCharacterTextSplitter  # noqa: F401
+    # Fallback to system sqlite3
+    pass
+
+import chromadb  # after shim
 
 # ==============================================================================
 # 1) Constants & Model Options
@@ -58,12 +55,12 @@ EMBED_MODEL = "text-embedding-3-small"
 @st.cache_resource
 def get_api_clients():
     clients = {}
-    if "OPENAI_API_KEY" in st.secrets:
+    if "OPENAI_API_KEY" in st.secrets and st.secrets["OPENAI_API_KEY"]:
         clients["OpenAI"] = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-    if "GOOGLE_API_KEY" in st.secrets:
+    if "GOOGLE_API_KEY" in st.secrets and st.secrets["GOOGLE_API_KEY"]:
         genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
         clients["Google"] = genai
-    if "ANTHROPIC_API_KEY" in st.secrets:
+    if "ANTHROPIC_API_KEY" in st.secrets and st.secrets["ANTHROPIC_API_KEY"]:
         clients["Anthropic"] = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
     return clients
 
@@ -81,17 +78,20 @@ EXPECTED_COLS = ["title", "summary", "content", "published_date", "source", "url
 @st.cache_data
 def load_news_data(file_bytes: bytes = None, filename: str = None) -> pd.DataFrame:
     if file_bytes:
-        df = pd.read_csv(pd.io.common.BytesIO(file_bytes))
+        df = pd.read_csv(BytesIO(file_bytes))
     else:
         if not os.path.exists(DEFAULT_CSV_PATH):
-            st.error("No CSV found. Upload a CSV with news articles.")
+            st.error("No CSV found. Upload a CSV with news articles (columns like title, summary, content, published_date, source, url).")
             st.stop()
         df = pd.read_csv(DEFAULT_CSV_PATH)
 
+    # Normalize columns (best effort)
     cols = {c.lower().strip(): c for c in df.columns}
+
     def pick(*cands):
         for c in cands:
-            if c in cols: return cols[c]
+            if c in cols:
+                return cols[c]
         return None
 
     title_c   = pick("title", "headline")
@@ -104,9 +104,9 @@ def load_news_data(file_bytes: bytes = None, filename: str = None) -> pd.DataFra
     if title_c is None:  df["title"] = ""
     else:                df.rename(columns={title_c: "title"}, inplace=True)
     if summary_c is None: df["summary"] = ""
-    else:                 df.rename(columns={summary_c: "summary"}, inplace=True)
+    else:                  df.rename(columns={summary_c: "summary"}, inplace=True)
     if content_c is None: df["content"] = ""
-    else:                 df.rename(columns={content_c: "content"}, inplace=True)
+    else:                  df.rename(columns={content_c: "content"}, inplace=True)
     if date_c is None: df["published_date"] = ""
     else:              df.rename(columns={date_c: "published_date"}, inplace=True)
     if source_c is None: df["source"] = ""
@@ -115,17 +115,25 @@ def load_news_data(file_bytes: bytes = None, filename: str = None) -> pd.DataFra
     else:             df.rename(columns={url_c: "url"}, inplace=True)
 
     df = df.fillna("")
-    df["text"] = (df["title"].astype(str) + " — " +
-                  df["summary"].astype(str) + "\n" +
-                  df["content"].astype(str))
+    df["text"] = (
+        df["title"].astype(str) + " — " +
+        df["summary"].astype(str) + "\n" +
+        df["content"].astype(str)
+    )
     return df[["title", "summary", "content", "published_date", "source", "url", "text"]]
 
 # ==============================================================================
 # 4) Vector DB ingest & retrieval
 # ==============================================================================
 def setup_news_vector_db(collection, openai_client, df: pd.DataFrame, force_rebuild: bool = False):
-    if (collection.count() or 0) > 0 and not force_rebuild:
-        st.sidebar.success(f"Vector DB ready ({collection.count()} items).")
+    # Only build once unless forced
+    try:
+        existing = collection.count()
+    except Exception:
+        existing = 0
+
+    if (existing or 0) > 0 and not force_rebuild:
+        st.sidebar.success(f"Vector DB ready ({existing} items).")
         return
 
     if df.empty:
@@ -150,17 +158,17 @@ def setup_news_vector_db(collection, openai_client, df: pd.DataFrame, force_rebu
         except Exception as e:
             st.error(f"Embedding batch {i}-{i+batch} failed: {e}")
 
-    st.sidebar.success(f"Vector DB built ✅ ({collection.count()} items)")
-
+    try:
+        built = collection.count()
+    except Exception:
+        built = 0
+    st.sidebar.success(f"Vector DB built ✅ ({built} items)")
 
 def get_relevant_context(collection, openai_client, query: str, n_results: int = 4):
     try:
-        st.write(f"🔍 DEBUG: Running query → {query}")
         count = collection.count()
-        st.write(f"📊 DEBUG: Collection count = {count}")
         if count == 0:
             return "No items in vector DB. Please rebuild it.", []
-        
         qemb = openai_client.embeddings.create(model=EMBED_MODEL, input=[query]).data[0].embedding
         res = collection.query(query_embeddings=[qemb], n_results=n_results)
         docs = res.get("documents", [[]])[0]
@@ -169,13 +177,13 @@ def get_relevant_context(collection, openai_client, query: str, n_results: int =
             return "No relevant context found.", []
         context_blocks, cites = [], []
         for d, m in zip(docs, metas):
-            title = m.get("title", "").strip()
-            src = m.get("source", "").strip()
-            url = m.get("url", "").strip()
-            date = m.get("published_date", "").strip()
+            title = (m or {}).get("title", "").strip()
+            src   = (m or {}).get("source", "").strip()
+            url   = (m or {}).get("url", "").strip()
+            date  = (m or {}).get("published_date", "").strip()
             header = f"[{title}] ({src}, {date}) {url}".strip()
             cites.append({"title": title, "source": src, "date": date, "url": url})
-            snippet = d[:1200]
+            snippet = (d or "")[:1200]
             context_blocks.append(f"{header}\n{snippet}")
         return "\n\n---\n\n".join(context_blocks), cites
     except Exception as e:
@@ -191,27 +199,35 @@ LEGAL_RE = re.compile(
     r"fine|penalty|settlement|consent decree|enforcement|"
     r"merger|acquisition|m&a|antitrust|sec|doj|ftc|cma|eu|ofac|"
     r"ip infringement|patent|trademark)", flags=re.IGNORECASE)
-MONEY_RE = re.compile(r"(\$|USD|€|EUR|£|GBP)\s?\d+([.,]\d{3})*(\s?(million|billion|m|bn))?", re.IGNORECASE)
+
+MONEY_RE = re.compile(
+    r"(\$|USD|€|EUR|£|GBP)\s?\d+([.,]\d{3})*(\s?(million|billion|m|bn))?",
+    re.IGNORECASE,
+)
 
 def safe_days_since(datestr: str) -> float:
     try:
-        dt_val = pd.to_datetime(datestr, errors="coerce")
-        if pd.isna(dt_val): return 60.0
+        dt_val = pd.to_datetime(datestr, errors="coerce", utc=False)
+        if pd.isna(dt_val):
+            return 60.0
         return max(0.0, (pd.Timestamp.now(tz=None) - dt_val).days)
     except Exception:
         return 60.0
 
 def compute_interest_scores(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df.assign(interest_score=0.0)
+    if df.empty:
+        return df.assign(interest_score=0.0)
     df = df.copy()
     df["recency_days"] = df["published_date"].astype(str).map(safe_days_since)
     df["legal_hits"] = df["text"].str.count(LEGAL_RE)
     df["money_flag"] = df["text"].str.contains(MONEY_RE).astype(int)
+
     recency = np.exp(-df["recency_days"] / 14.0) * 25
     legal   = np.minimum(df["legal_hits"], 5) / 5.0 * 25
     scale   = df["money_flag"] * 15
     source  = 10.0
     uniq    = 5.0
+
     df["interest_score"] = recency + legal + scale + source + uniq
     return df.sort_values("interest_score", ascending=False)
 
@@ -233,16 +249,11 @@ def llm_answer(clients, provider: str, model: str, query: str, context: str) -> 
             if client is None:
                 raise RuntimeError("OpenAI client missing.")
 
-            # --- SPECIAL HANDLING for small models ---
+            # Small models have stricter limits
             is_small = model in ["gpt-5-nano", "gpt-5-mini"]
-
-            # Trim context aggressively for small models (token window is tighter)
-            compact_context = context if not is_small else (
-    "\n\n".join(context.split("\n\n")[:3])[:1000] if context else "")
-
+            compact_context = context if not is_small else ("\n\n".join(context.split("\n\n")[:3])[:1000] if context else "")
             user_prompt_local = f"CONTEXT:\n{compact_context}\n\nQUESTION:\n{query}"
 
-            # Build params
             params = {
                 "model": model,
                 "messages": [
@@ -251,10 +262,9 @@ def llm_answer(clients, provider: str, model: str, query: str, context: str) -> 
                 ],
             }
 
-            # Small models prefer `max_tokens` and default temperature
             if is_small:
                 params["max_completion_tokens"] = 220
-                # do NOT set temperature for nano/mini (some versions reject it)
+                # no temperature for nano/mini
             else:
                 params["max_completion_tokens"] = 400
                 params["temperature"] = 0.2
@@ -262,14 +272,14 @@ def llm_answer(clients, provider: str, model: str, query: str, context: str) -> 
             resp = client.chat.completions.create(**params)
             content = (resp.choices[0].message.content or "").strip()
 
-            # Fallback retry if we got a blank response (common with tiny models)
             if not content:
                 retry_params = {
-    "model": model,
-    "messages": [
-        {"role": "user",
-         "content": f"Answer briefly (1–3 sentences) based only on this text:\n{compact_context}\n\nQuestion: {query}"},],}
-                
+                    "model": model,
+                    "messages": [
+                        {"role": "user",
+                         "content": f"Answer briefly (1–3 sentences) based only on this text:\n{compact_context}\n\nQuestion: {query}"},
+                    ],
+                }
                 if is_small:
                     retry_params["max_completion_tokens"] = 220
                 else:
@@ -283,14 +293,16 @@ def llm_answer(clients, provider: str, model: str, query: str, context: str) -> 
 
         elif provider == "Google":
             g = clients.get("Google")
-            if g is None: raise RuntimeError("Google client missing.")
+            if g is None:
+                raise RuntimeError("Google client missing.")
             model_obj = g.GenerativeModel(model)
             out = model_obj.generate_content(f"{system_prompt}\n\n{user_prompt}")
-            return (out.text or "").strip()
+            return (getattr(out, "text", "") or "").strip()
 
         elif provider == "Anthropic":
             a = clients.get("Anthropic")
-            if a is None: raise RuntimeError("Anthropic client missing.")
+            if a is None:
+                raise RuntimeError("Anthropic client missing.")
             msg = a.messages.create(
                 model=model,
                 system=system_prompt,
@@ -307,7 +319,7 @@ def llm_answer(clients, provider: str, model: str, query: str, context: str) -> 
 # ==============================================================================
 # 7) UI helpers
 # ==============================================================================
-def render_ranked_card(row):
+def render_ranked_card(row: pd.Series):
     url = row.get("url", "")
     t   = row.get("title", "Untitled")
     src = row.get("source", "Unknown source")
@@ -340,10 +352,13 @@ def main():
                         uploaded.name if uploaded else None)
 
     clients = get_api_clients()
-    if provider not in clients:
-        st.sidebar.error(f"API key missing for {provider}. Add it in Streamlit Secrets.")
+
+    # HARD REQUIREMENT: OpenAI is used for embeddings for the vector DB.
+    if "OpenAI" not in clients:
+        st.sidebar.error("OpenAI API key is required for embeddings (Vector DB). Add OPENAI_API_KEY in Secrets.")
         st.stop()
 
+    # Chroma collection
     collection = get_chroma_collection()
 
     col_a, col_b = st.sidebar.columns(2)
@@ -359,9 +374,15 @@ def main():
             st.session_state.pop("hw7_messages", None)
             st.rerun()
 
-    setup_news_vector_db(collection, clients["OpenAI"], df, force_rebuild=(collection.count() == 0))
+    # Build collection if empty
+    try:
+        empty = (collection.count() or 0) == 0
+    except Exception:
+        empty = True
+    setup_news_vector_db(collection, clients["OpenAI"], df, force_rebuild=empty)
 
     tab_ask, tab_rank = st.tabs(["Ask the Bot (RAG)", "Explore Most Interesting"])
+
     if "hw7_messages" not in st.session_state:
         st.session_state.hw7_messages = []
 
@@ -392,12 +413,14 @@ def main():
             st.session_state.hw7_messages.append({"role": "user", "content": query})
             with st.chat_message("user"):
                 st.markdown(query)
+
             context, cites = get_relevant_context(collection, clients["OpenAI"], query, n_results=4)
             answer = llm_answer(clients, provider, model, query, context)
             final = f"**Answer (`{provider} / {model}`):**\n\n{answer}"
             st.session_state.hw7_messages.append({"role": "assistant", "content": final})
             with st.chat_message("assistant"):
                 st.markdown(final)
+
             if cites:
                 with st.expander("Sources from retrieved context"):
                     for c in cites:
