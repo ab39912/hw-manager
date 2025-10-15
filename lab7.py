@@ -34,8 +34,8 @@ import chromadb  # after shim
 # ==============================================================================
 # 1) Constants & Model Options
 # ==============================================================================
-PAGE_TITLE = "HW7: News Bot"
-
+PAGE_TITLE = "HW7: News Information Bot"
+PAGE_ICON = "🗞️"
 
 CHROMA_DB_PATH = "./ChromaDB_RAG"
 CHROMA_COLLECTION_NAME = "HW7_NewsCollection"
