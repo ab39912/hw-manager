@@ -11,11 +11,11 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 # ---- LLM SDKs ----
 try:
-    import google.generativeai as genai   # pip install -U google-generativeai>=0.7
+    import google.generativeai as genai   # pip install -U google-generativeai
 except Exception:
     genai = None
 try:
-    import anthropic                      # pip install -U anthropic>=0.25
+    import anthropic                      # pip install -U anthropic
 except Exception:
     anthropic = None
 
@@ -31,6 +31,14 @@ DEFAULT_LEGAL_TERMS = [
 
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
 CLAUDE_MODELS = ["claude-opus-4-1-20250805", "claude-sonnet-4-20250514"]
+
+# --- Optional relaxed safety for Gemini (reduces false positives) ---
+SAFETY_RELAXED = [
+    {"category": "HARM_CATEGORY_HARASSMENT",       "threshold": "BLOCK_ONLY_HIGH"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH",      "threshold": "BLOCK_ONLY_HIGH"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT","threshold": "BLOCK_ONLY_HIGH"},
+    {"category": "HARM_CATEGORY_SEXUAL_CONTENT",   "threshold": "BLOCK_ONLY_HIGH"},
+]
 
 
 # ---------- Scoring helpers ----------
@@ -61,12 +69,6 @@ class TfIdfIndex:
 
 # ---------- CSV → internal schema ----------
 def normalize_from_example_csv(file) -> pd.DataFrame:
-    """
-    Input columns:
-      - company_name, days_since_2000, Date, Document, URL
-    Output (internal schema):
-      id,title,text,date,source,url,engagement,age_days,doc
-    """
     df = pd.read_csv(file)
     need = ["company_name", "Date", "Document", "URL"]
     miss = [c for c in need if c not in df.columns]
@@ -82,17 +84,14 @@ def normalize_from_example_csv(file) -> pd.DataFrame:
 
     out["title"] = pd.Series(title).fillna("Untitled")
     out["text"] = docs
-
-    # Timezone-safe: parse as UTC and drop tz → tz-naive
     out["date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True).dt.tz_convert(None)
-
     out["source"] = df["company_name"].fillna("Unknown")
     out["url"] = df["URL"].fillna("")
-    out["engagement"] = 0  # not provided
+    out["engagement"] = 0
 
     out = out.dropna(subset=["date"]).reset_index(drop=True)
 
-    now_ts = pd.Timestamp.utcnow().tz_localize(None)  # tz-naive to match 'date'
+    now_ts = pd.Timestamp.utcnow().tz_localize(None)
     out["age_days"] = (now_ts - out["date"]).dt.days.clip(lower=0)
     out["doc"] = (out["title"].str.strip() + " || " + out["text"].str.strip()).str.lower()
     return out
@@ -100,7 +99,6 @@ def normalize_from_example_csv(file) -> pd.DataFrame:
 
 # ---------- Novelty + ranking ----------
 def novelty_from_tfidf(index: TfIdfIndex, order_idx: List[int]) -> np.ndarray:
-    """Greedy novelty = 1 - max cosine similarity to any previously-seen (newer) doc."""
     M = index.mat
     novelty = np.ones(M.shape[0], dtype=float)
     seen = []
@@ -157,10 +155,7 @@ def make_context(block_df: pd.DataFrame, k: int = TOP_K_CONTEXT) -> str:
 def gemini_client():
     if genai is None:
         raise RuntimeError("Gemini SDK not installed. `pip install google-generativeai`")
-    api_key = (
-        st.secrets.get("GOOGLE_API_KEY")
-        or st.secrets.get("GEMINI_API_KEY")
-    )
+    api_key = st.secrets.get("GOOGLE_API_KEY") or st.secrets.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GOOGLE_API_KEY (or GEMINI_API_KEY) not found in secrets.toml")
     genai.configure(api_key=api_key)
@@ -175,28 +170,20 @@ def anthropic_client():
     return anthropic.Anthropic(api_key=api_key)
 
 
-# ---------- Gemini robust extraction helper ----------
+# ---------- Helpers ----------
 def _gemini_extract_text(resp):
-    """
-    Robustly extract text from a google-generativeai response.
-    Returns (text, finish_reason, safety) where `text` may be "".
-    """
-    # Try quick accessor first
+    """Extract text safely from google-generativeai response."""
     try:
         txt = (getattr(resp, "text", None) or "").strip()
     except Exception:
         txt = ""
-
-    finish_reason = None
-    safety = None
-
+    finish_reason, safety = None, None
     try:
         cands = getattr(resp, "candidates", []) or []
         if cands:
             cand0 = cands[0]
             finish_reason = getattr(cand0, "finish_reason", None) or getattr(cand0, "finishReason", None)
             safety = getattr(cand0, "safety_ratings", None) or getattr(cand0, "safetyRatings", None)
-
             if not txt:
                 parts = []
                 content = getattr(cand0, "content", None)
@@ -210,33 +197,36 @@ def _gemini_extract_text(resp):
                 txt = "\n".join(parts).strip()
     except Exception:
         pass
-
     return txt, finish_reason, safety
+
+def _neutralize_prompt(user_prompt: str) -> str:
+    """Gently nudge toward neutral, factual tone to reduce safety blocks."""
+    return (
+        user_prompt.strip()
+        + "\n\nWrite in a neutral, factual tone. Avoid graphic, explicit, or inflammatory language."
+        + " If sensitive terms appear in sources, summarize them abstractly without detail."
+    )
 
 
 # ---------- LLM calls ----------
 def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: str,
-                    max_tokens: int = 800, temperature: float = 0.2) -> str:
+                    max_tokens: int = 700, temperature: float = 0.2,
+                    safety_relaxed: bool = False) -> str:
     """
-    Calls the selected LLM.
-
     Gemini:
-      - Construct GenerativeModel with system_instruction.
-      - generate_content with explicit contents payload.
-      - Robust extraction + fallback on empty text (safety/max_tokens).
-
+      - GenerativeModel with system_instruction.
+      - generate_content with explicit contents + optional relaxed safety.
+      - Robust extraction + fallback (shorter prompt, then flash).
     Anthropic:
-      - Messages API (max_tokens, temperature).
+      - Messages API.
     """
     if provider == "Gemini":
         client = gemini_client()
         try:
-            model_obj = client.GenerativeModel(
-                model_name=model,
-                system_instruction=system_prompt
-            )
+            model_obj = client.GenerativeModel(model_name=model, system_instruction=system_prompt)
 
-            contents = [{"role": "user", "parts": [user_prompt]}]
+            contents = [{"role": "user", "parts": [_neutralize_prompt(user_prompt)]}]
+            safety_settings = SAFETY_RELAXED if safety_relaxed else None
 
             resp = model_obj.generate_content(
                 contents,
@@ -245,15 +235,16 @@ def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: 
                     "temperature": temperature,
                     "candidate_count": 1,
                 },
+                safety_settings=safety_settings,
             )
 
-            text, finish_reason, _safety = _gemini_extract_text(resp)
+            text, finish_reason, _ = _gemini_extract_text(resp)
 
-            # If empty, try a gentler, shorter fallback
+            # If empty, try concise fallback
             if not text:
                 fallback_prompt = (
-                    user_prompt
-                    + "\n\nPlease summarize in 4–6 concise bullet points with brief legal implications."
+                    _neutralize_prompt(user_prompt)
+                    + "\n\nPlease produce 4–6 concise bullet points and a brief 'Why this matters' paragraph."
                 )
                 resp2 = model_obj.generate_content(
                     [{"role": "user", "parts": [fallback_prompt]}],
@@ -262,12 +253,13 @@ def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: 
                         "temperature": 0.2,
                         "candidate_count": 1,
                     },
+                    safety_settings=safety_settings,
                 )
-                text2, finish_reason2, _safety2 = _gemini_extract_text(resp2)
+                text2, finish_reason2, _ = _gemini_extract_text(resp2)
                 if text2:
                     return text2
 
-                # Final fallback: switch to 2.5-flash
+                # Final fallback: switch to flash
                 try:
                     if model != "gemini-2.5-flash":
                         model_obj_flash = client.GenerativeModel(
@@ -281,8 +273,9 @@ def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: 
                                 "temperature": 0.2,
                                 "candidate_count": 1,
                             },
+                            safety_settings=safety_settings,
                         )
-                        text3, finish_reason3, _safety3 = _gemini_extract_text(resp3)
+                        text3, finish_reason3, _ = _gemini_extract_text(resp3)
                         if text3:
                             return text3
                         finish_reason = finish_reason3 or finish_reason
@@ -292,13 +285,11 @@ def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: 
                 return (
                     f"⚠️ Gemini returned no text (finish_reason={finish_reason}). "
                     f"This can happen due to safety or token limits. "
-                    f"Try a more neutral phrasing or use 'gemini-2.5-flash'."
+                    f"Try 'Use relaxed safety' or switch to 'gemini-2.5-flash'."
                 )
 
-            # Normal successful path
             if finish_reason and str(finish_reason).upper() not in ("STOP", "FINISH_REASON_STOP"):
                 return text + f"\n\n_(Note: model finish_reason={finish_reason})_"
-
             return text
 
         except Exception as e:
@@ -331,19 +322,18 @@ def run():
     st.set_page_config(page_title="News Reporting Bot", layout="wide")
     st.title("📰 News Reporting Bot")
 
-    # ---- one-time migration to clear stale state when code changes ----
-    APP_VERSION = "2025-10-14-gemini-fix"
+    # one-time migration to clear stale state
+    APP_VERSION = "2025-10-14-gemini-relaxed"
     if st.session_state.get("_app_version") != APP_VERSION:
-        for k in ["provider", "model", "weights", "legal_terms", "adv_k", "adv_pool", "adv_k_slider", "adv_pool_slider"]:
+        for k in ["provider", "model", "weights", "legal_terms", "adv_k", "adv_pool",
+                  "adv_k_slider", "adv_pool_slider", "safety_relaxed"]:
             st.session_state.pop(k, None)
         st.session_state["_app_version"] = APP_VERSION
 
-    # Guard for any legacy/invalid provider values
     valid_providers = {"Gemini", "Claude"}
     if st.session_state.get("provider") not in valid_providers:
         st.session_state.provider = "Gemini"
 
-    # Safe session defaults
     if "weights" not in st.session_state:
         st.session_state.weights = {"recency": 0.35, "engagement": 0.15, "novelty": 0.25, "legal": 0.25}
     if "legal_terms" not in st.session_state:
@@ -352,24 +342,18 @@ def run():
         st.session_state.provider = "Gemini"
     if "model" not in st.session_state:
         st.session_state.model = GEMINI_MODELS[0]
+    if "safety_relaxed" not in st.session_state:
+        st.session_state.safety_relaxed = False
 
-    # Sidebar (minimal)
     with st.sidebar:
-        # Reset button for quick full refresh
         if st.button("🔄 Reset app & clear cache"):
-            try:
-                st.cache_data.clear()
-            except Exception:
-                pass
-            try:
-                st.cache_resource.clear()
-            except Exception:
-                pass
+            try: st.cache_data.clear()
+            except Exception: pass
+            try: st.cache_resource.clear()
+            except Exception: pass
             st.session_state.clear()
-            try:
-                st.rerun()  # Streamlit >= 1.30
-            except Exception:
-                st.experimental_rerun()
+            try: st.rerun()
+            except Exception: st.experimental_rerun()
         st.markdown("---")
 
         st.header("Upload CSV")
@@ -392,7 +376,6 @@ def run():
             )
         st.session_state.model = model
 
-        # Advanced controls hidden by default
         with st.expander("Advanced (weights, legal keywords, params)", expanded=False):
             w = st.session_state.weights
             wR = st.slider("Recency", 0.0, 1.0, float(w["recency"]), 0.05)
@@ -407,19 +390,20 @@ def run():
             terms_txt = st.text_area("Legal keywords (comma-separated)", ", ".join(st.session_state.legal_terms), height=120)
             st.session_state.legal_terms = [t.strip() for t in terms_txt.split(",") if t.strip()]
 
-            # Store params (if user opens expander)
             st.session_state.adv_k = st.slider("Top-k", 3, 15, 6, key="adv_k_slider")
             st.session_state.adv_pool = st.slider("Retriever pool (topic)", 20, 200, 60, step=10, key="adv_pool_slider")
 
-    # Defaults if Advanced never opened
+            st.session_state.safety_relaxed = st.checkbox("Use relaxed safety (BLOCK_ONLY_HIGH)", value=st.session_state.safety_relaxed,
+                                                          help="Reduces false safety blocks while keeping protections.")
+
     k = st.session_state.get("adv_k", st.session_state.get("adv_k_slider", 6))
     pool = st.session_state.get("adv_pool", st.session_state.get("adv_pool_slider", 60))
+    safety_relaxed = st.session_state.get("safety_relaxed", False)
 
     if up is None:
         st.info("Upload the CSV to activate the app.")
         return
 
-    # Load & index
     try:
         df = normalize_from_example_csv(up)
     except Exception as e:
@@ -445,7 +429,10 @@ Context:
 {ctx}
 
 Output: 3–6 bullets + a short "Why this matters" paragraph."""
-            ans = answer_with_llm(st.session_state.provider, st.session_state.model, system, user)
+            ans = answer_with_llm(
+                st.session_state.provider, st.session_state.model, system, user,
+                max_tokens=700, temperature=0.2, safety_relaxed=safety_relaxed
+            )
             st.markdown("### Answer")
             st.write(ans)
             st.markdown("### Top-k ranked")
@@ -463,7 +450,10 @@ Output: 3–6 bullets + a short "Why this matters" paragraph."""
 Use the context below to answer succinctly and cite items as [#]. Explain legal implications.
 Context:
 {ctx}"""
-            ans = answer_with_llm(st.session_state.provider, st.session_state.model, system, user)
+            ans = answer_with_llm(
+                st.session_state.provider, st.session_state.model, system, user,
+                max_tokens=700, temperature=0.2, safety_relaxed=safety_relaxed
+            )
             st.markdown("### Answer")
             st.write(ans)
             st.markdown("### Top-k ranked")
