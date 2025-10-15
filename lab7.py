@@ -226,7 +226,7 @@ def answer_with_llm(provider: str, model: str, system_prompt: str, user_prompt: 
 
 # ---------- Streamlit app ----------
 def run():
-    st.set_page_config(page_title="News Reporting Bot", layout="wide")
+    st.set_page_config(page_title="HW-7 News Reporting Bot", layout="wide")
     st.title("📰 News Reporting Bot")
 
     # Safe session defaults
