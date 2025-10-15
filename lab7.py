@@ -1,4 +1,4 @@
-# pages/HW7.py
+# lab7.py
 # ──────────────────────────────────────────────────────────────────────────────
 # HW7: News Information Bot (Streamlit + Multi-Vendor + ChromaDB + CSV RAG)
 # Ranks "most interesting" news for a global law firm and answers questions.
@@ -20,7 +20,7 @@ import google.generativeai as genai
 from anthropic import Anthropic
 
 # ==============================================================================
-# 0) SQLite shim (for older Linux images in Streamlit Cloud)
+# 0) SQLite shim (for older Linux images in some Streamlit runtimes)
 # ==============================================================================
 try:
     __import__("pysqlite3")
@@ -47,7 +47,7 @@ MODEL_OPTIONS = {
     "Anthropic": ["claude-3-haiku-20240307", "claude-3-5-sonnet-20240620", "claude-sonnet-4-20250514"],
 }
 
-EMBED_MODEL = "text-embedding-3-small"
+EMBED_MODEL = "text-embedding-3-small"  # used for Chroma embeddings
 
 # ==============================================================================
 # 2) Cached clients & Chroma collection
@@ -81,7 +81,10 @@ def load_news_data(file_bytes: bytes = None, filename: str = None) -> pd.DataFra
         df = pd.read_csv(BytesIO(file_bytes))
     else:
         if not os.path.exists(DEFAULT_CSV_PATH):
-            st.error("No CSV found. Upload a CSV with news articles (columns like title, summary, content, published_date, source, url).")
+            st.error(
+                "No CSV found. Upload a CSV with news articles (columns like "
+                "`title, summary, content, published_date, source, url`)."
+            )
             st.stop()
         df = pd.read_csv(DEFAULT_CSV_PATH)
 
@@ -153,8 +156,12 @@ def setup_news_vector_db(collection, openai_client, df: pd.DataFrame, force_rebu
         try:
             resp = openai_client.embeddings.create(model=EMBED_MODEL, input=chunk_texts)
             embeddings = [d.embedding for d in resp.data]
-            collection.add(ids=chunk_ids, documents=chunk_texts,
-                           embeddings=embeddings, metadatas=chunk_meta)
+            collection.add(
+                ids=chunk_ids,
+                documents=chunk_texts,
+                embeddings=embeddings,
+                metadatas=chunk_meta,
+            )
         except Exception as e:
             st.error(f"Embedding batch {i}-{i+batch} failed: {e}")
 
@@ -198,7 +205,8 @@ LEGAL_RE = re.compile(
     r"regulation|regulatory|compliance|sanction|gdpr|ccpa|hipaa|"
     r"fine|penalty|settlement|consent decree|enforcement|"
     r"merger|acquisition|m&a|antitrust|sec|doj|ftc|cma|eu|ofac|"
-    r"ip infringement|patent|trademark)", flags=re.IGNORECASE)
+    r"ip infringement|patent|trademark)", flags=re.IGNORECASE
+)
 
 MONEY_RE = re.compile(
     r"(\$|USD|€|EUR|£|GBP)\s?\d+([.,]\d{3})*(\s?(million|billion|m|bn))?",
@@ -251,7 +259,9 @@ def llm_answer(clients, provider: str, model: str, query: str, context: str) -> 
 
             # Small models have stricter limits
             is_small = model in ["gpt-5-nano", "gpt-5-mini"]
-            compact_context = context if not is_small else ("\n\n".join(context.split("\n\n")[:3])[:1000] if context else "")
+            compact_context = context if not is_small else (
+                "\n\n".join(context.split("\n\n")[:3])[:1000] if context else ""
+            )
             user_prompt_local = f"CONTEXT:\n{compact_context}\n\nQUESTION:\n{query}"
 
             params = {
@@ -311,8 +321,10 @@ def llm_answer(clients, provider: str, model: str, query: str, context: str) -> 
                 temperature=0.2,
             )
             return msg.content[0].text.strip()
+
         else:
             return "Unsupported provider selected."
+
     except Exception as e:
         return f"Model error: {e}"
 
@@ -432,6 +444,9 @@ def main():
 
     st.caption("Tip: Use the sidebar to switch providers/models and compare quality, cost, and latency.")
 
+# ── Option A wrapper so streamlit_app.py can call lab7.run() ────────────────
+def run():
+    return main()
 
 if __name__ == "__main__":
     main()
